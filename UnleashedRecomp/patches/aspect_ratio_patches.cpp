@@ -1,3 +1,15 @@
+
+
+#include <cstdio>
+#include "../archipelago_client.h"
+#include "ap_stage_registry.h"
+#include <chrono>
+#include <cstring>
+#include <curl/curl.h>
+#include <string>
+#include <unordered_set>
+#include <unordered_map>
+#include <cstdint>
 #include <user/config.h>
 #include <api/SWA.h>
 #include <app.h>
@@ -5,7 +17,9 @@
 #include <ui/black_bar.h>
 #include <gpu/video.h>
 #include <xxHashMap.h>
-
+#include <os/logger.h>
+#include <kernel/function.h>
+#include <ppc/ppc_recomp_shared.h>
 #include "aspect_ratio_patches.h"
 #include "camera_patches.h"
 #include "inspire_patches.h"
@@ -227,11 +241,382 @@ static void GetViewport(void* application, be<uint32_t>* width, be<uint32_t>* he
 
 GUEST_FUNCTION_HOOK(sub_82E169B8, GetViewport);
 
+
+static void AP_RememberRankStage(const std::string& stage);
+
+static void AP_WatchActRank()
+{
+    static std::string lastStage;
+    static int lastRank = -1;
+    static bool initialized = false;
+
+    auto* gameDoc = SWA::CGameDocument::GetInstance();
+
+    if (!gameDoc || !gameDoc->m_pMember)
+        return;
+
+    const std::string stage =
+        gameDoc->m_pMember->m_StageName.c_str();
+
+    // BEGIN AP_MUSIC_RESULT_DIAGNOSTIC
+    static std::string apMusicPreviousStage = "<initial>";
+    if (stage != apMusicPreviousStage)
+    {
+        if (FILE* f = std::fopen("ap_music_stage.log", "a"))
+        {
+            std::fprintf(f, "STAGE: '%s' -> '%s'\n",
+                apMusicPreviousStage.c_str(), stage.c_str());
+            std::fclose(f);
+        }
+        apMusicPreviousStage = stage;
+    }
+    // END AP_MUSIC_RESULT_DIAGNOSTIC
+    if (!stage.empty())
+    {
+        // The screen-position hook runs during normal gameplay, not just medal events.
+        // Remember the active act before the results screen clears its Stage ID.
+        AP_RememberRankStage(stage);
+        if (stage != lastStage)
+        {
+            lastStage = stage;
+            LOGFN("AP RANK WATCH: STAGE = {}", stage);
+        }
+    }
+
+    auto* appDoc = SWA::CApplicationDocument::GetInstance();
+
+    if (!appDoc || !appDoc->m_pMember)
+        return;
+
+    auto* gameParam =
+        appDoc->m_pMember->m_spGameParameter.get();
+
+    if (!gameParam)
+        return;
+
+    auto* saveData = gameParam->m_pSaveData.get();
+
+    if (!saveData)
+        return;
+
+    // AP Rings : lecture du total sauvegarde (Big Endian).
+    static bool apRingsReadLogged = false;
+    if (!apRingsReadLogged)
+    {
+        const auto* ringBytes = reinterpret_cast<const uint8_t*>(saveData) + 0x85A8;
+        const std::uint32_t rings =
+            (std::uint32_t(ringBytes[0]) << 24) |
+            (std::uint32_t(ringBytes[1]) << 16) |
+            (std::uint32_t(ringBytes[2]) << 8) |
+             std::uint32_t(ringBytes[3]);
+
+        LOGFN("AP RINGS SAVE READ: {}", rings);
+        apRingsReadLogged = true;
+    }
+    // AP Rings : application des bonus en attente sur le thread du jeu.
+    // TEST LOCAL UNIQUEMENT : ne pas utiliser avec les vrais items AP
+    // avant d'avoir implemente la protection persistante contre les doublons.
+    /* ANCIEN BONUS RINGS SAUVEGARDE DESACTIVE
+    const std::uint32_t apRingBonus = APClient::GetPendingRingBonus();
+    if (apRingBonus > 0)
+    {
+        auto* ringBytes = reinterpret_cast<std::uint8_t*>(saveData) + 0x85A8;
+
+        const std::uint32_t oldRings =
+            (std::uint32_t(ringBytes[0]) << 24) |
+            (std::uint32_t(ringBytes[1]) << 16) |
+            (std::uint32_t(ringBytes[2]) << 8) |
+             std::uint32_t(ringBytes[3]);
+
+        const std::uint32_t newRings =
+            oldRings > UINT32_MAX - apRingBonus
+                ? UINT32_MAX
+                : oldRings + apRingBonus;
+
+        ringBytes[0] = static_cast<std::uint8_t>(newRings >> 24);
+        ringBytes[1] = static_cast<std::uint8_t>(newRings >> 16);
+        ringBytes[2] = static_cast<std::uint8_t>(newRings >> 8);
+        ringBytes[3] = static_cast<std::uint8_t>(newRings);
+
+        LOGFN("AP RINGS APPLIED: {} + {} = {}",
+            oldRings, apRingBonus, newRings);
+    }
+    */
+    LOGFN("AP SAVE POINTER: {}", static_cast<const void*>(saveData));
+
+    const auto* bytes =
+        reinterpret_cast<const uint8_t*>(saveData);
+
+    // Offset confirme pour Mykonos Act 2 uniquement.
+    const int rank = bytes[0x00D7];
+
+    if (!initialized)
+    {
+        initialized = true;
+        lastRank = rank;
+        LOGFN("AP RANK WATCH: INITIAL RANK = {}", rank);
+    }
+    else if (rank != lastRank)
+    {
+        LOGFN(
+            "AP RANK WATCH: RANK CHANGE {} -> {} | STAGE = {}",
+            lastRank, rank, stage
+        );
+
+        lastRank = rank;
+    }
+}
+
+
+// Archipelago Shoes: diagnostic en lecture seule pour retrouver les flags en RAM.
+// Les offsets 0x8998..0x899B sont des offsets du fichier SYS-DATA,
+// PAS des offsets memoire verifies.
+static void AP_DiagnoseShoesMemory()
+{
+    static bool logged = false;
+    if (logged)
+        return;
+
+    auto* gameDoc = SWA::CGameDocument::GetInstance();
+    if (!gameDoc || !gameDoc->m_pMember ||
+        gameDoc->m_pMember->m_StageName.c_str()[0] == '\0')
+        return;
+
+    auto* appDoc = SWA::CApplicationDocument::GetInstance();
+    if (!appDoc || !appDoc->m_pMember)
+        return;
+
+    auto* gameParam = appDoc->m_pMember->m_spGameParameter.get();
+    if (!gameParam || !gameParam->m_pSaveData.get())
+        return;
+
+    const auto* bytes = reinterpret_cast<const uint8_t*>(gameParam->m_pSaveData.get());
+    constexpr size_t size = sizeof(SWA::CGameParameter::SSaveData);
+    logged = true;
+
+    LOGFN("AP SHOES RAM: diagnostic read-only; SSaveData size=0x{:X}",
+        static_cast<uint32_t>(size));
+
+    // Hypothese seulement : si SYS-DATA se terminait par SSaveData,
+    // l'offset fichier 0x8998 correspondrait a 0x67C4 en RAM.
+    constexpr size_t candidate = 0x67C4;
+    if (candidate + 4 <= size)
+        LOGFN("AP SHOES RAM: candidate 0x67C4 = {:02X} {:02X} {:02X} {:02X}",
+            bytes[candidate], bytes[candidate + 1],
+            bytes[candidate + 2], bytes[candidate + 3]);
+
+    // Sequence observee dans le SYS-DATA 'SAVE WITH SHOES'.
+    // Une correspondance est une piste, pas une preuve.
+    static constexpr uint8_t signature[] =
+        { 0x63, 0x01, 0x01, 0x01, 0x01, 0x01, 0x07, 0x01, 0x07, 0x01, 0x07 };
+    size_t matches = 0;
+    for (size_t i = 0; i + sizeof(signature) <= size; ++i)
+    {
+        if (std::memcmp(bytes + i, signature, sizeof(signature)) == 0)
+        {
+            LOGFN("AP SHOES RAM: signature found at 0x{:X}; shoe bytes candidate 0x{:X}",
+                static_cast<uint32_t>(i), static_cast<uint32_t>(i + 1));
+            ++matches;
+        }
+    }
+    LOGFN("AP SHOES RAM: signature matches={}", matches);
+
+    // AP CD RAM : recherche des CD #35, #36 et #37.
+    // Diagnostic en lecture seule.
+    static constexpr uint8_t cdSignature[] =
+        { 0x01, 0x07, 0x01, 0x07, 0x01, 0x07 };
+
+    size_t cdMatches = 0;
+
+    for (size_t i = 0; i + sizeof(cdSignature) <= size; ++i)
+    {
+        if (std::memcmp(bytes + i, cdSignature, sizeof(cdSignature)) == 0)
+        {
+            if (cdMatches < 20)
+                LOGFN("AP CD RAM: signature found at 0x{:X}",
+                    static_cast<uint32_t>(i));
+
+            ++cdMatches;
+        }
+    }
+
+    LOGFN("AP CD RAM: total matches={}", cdMatches);
+}
+
 // SWA::CGameDocument::ComputeScreenPosition
 PPC_FUNC_IMPL(__imp__sub_8250FC70);
 PPC_FUNC(sub_8250FC70)
 {
     __imp__sub_8250FC70(ctx, base);
+    static unsigned int apTriggerCalls = 0;
+    if (++apTriggerCalls <= 10) LOGFN("AP FILLER TRIGGER TEST: {} appels", apTriggerCalls);
+    // AP Crystal XP : application depuis le thread du jeu.
+    {
+        auto* appDoc = SWA::CApplicationDocument::GetInstance();
+        auto* param = (appDoc && appDoc->m_pMember)
+            ? appDoc->m_pMember->m_spGameParameter.get()
+            : nullptr;
+        auto* save = param ? param->m_pSaveData.get() : nullptr;
+
+        if (save)
+        {
+            const std::uint32_t crystalXP =
+                APClient::GetPendingCrystalXPBonus();
+
+            if (crystalXP == 50u ||
+                crystalXP == 100u ||
+                crystalXP == 200u)
+            {
+                LOGFN("AP CRYSTAL XP: applying +{} XP", crystalXP);
+
+                GuestToHostFunction<void>(
+                    sub_823A8760, 0u, crystalXP
+                );
+
+                APClient::ConfirmCrystalXPBonusApplied();
+
+                LOGFN("AP CRYSTAL XP: native call completed");
+            }
+        }
+    }
+
+            static bool apHookTestLogged = false;
+
+    if (!apHookTestLogged)
+    {
+        LOGFN("AP RANK WATCH: HOOK EXECUTED");
+        apHookTestLogged = true;
+    }
+
+        static bool apLocalRingsTestDone = false;
+        if (!apLocalRingsTestDone)
+        {
+            apLocalRingsTestDone = true;
+            // AP_TestLocalRings(); // Ancien test des Rings desactive
+        }
+        AP_WatchActRank();
+        AP_DiagnoseShoesMemory();
+        // AP CD RAM : diagnostic independant en lecture seule.
+        {
+            static unsigned cdCounter = 0;
+            static bool cdInitialized = false;
+            static std::vector<size_t> cdPreviousMatches;
+
+            if (++cdCounter >= 1)
+            {
+                cdCounter = 0;
+
+                auto* appDoc = SWA::CApplicationDocument::GetInstance();
+                auto* param = (appDoc && appDoc->m_pMember)
+                    ? appDoc->m_pMember->m_spGameParameter.get()
+                    : nullptr;
+                auto* save = param ? param->m_pSaveData.get() : nullptr;
+
+                if (!save)
+                {
+                    cdInitialized = false;
+                    cdPreviousMatches.clear();
+                }
+                else
+                {
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(save);
+                    constexpr size_t size = sizeof(SWA::CGameParameter::SSaveData);
+                    static constexpr uint8_t signature[] =
+                        { 0x01, 0x07, 0x01, 0x07, 0x01, 0x07 };
+
+                    // AP CD RAM : verifier les octets candidats des CD #35-37.
+                    constexpr size_t cdOffset = 0x8198;
+                    if (cdOffset + 6 <= size)
+                    {
+                        static bool firstRead = true;
+                        static uint8_t previousCD[6]{};
+
+                        if (firstRead ||
+                            std::memcmp(previousCD, bytes + cdOffset, 6) != 0)
+                        {
+                            LOGFN(
+                                "AP CD BYTES 0x8198: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                                bytes[cdOffset], bytes[cdOffset + 1],
+                                bytes[cdOffset + 2], bytes[cdOffset + 3],
+                                bytes[cdOffset + 4], bytes[cdOffset + 5]
+                            );
+
+                            std::memcpy(previousCD, bytes + cdOffset, 6);
+                            firstRead = false;
+                        }
+                    }
+                    
+                    std::vector<size_t> found;
+
+                    for (size_t i = 0; i + sizeof(signature) <= size; ++i)
+                    {
+                        if (std::memcmp(bytes + i, signature, sizeof(signature)) == 0)
+                            found.push_back(i);
+                    }
+
+                    if (!cdInitialized || found != cdPreviousMatches)
+                    {
+                        LOGFN("AP CD WATCH ACTIVE: total matches={}", found.size());
+
+                        for (size_t i = 0; i < found.size() && i < 20; ++i)
+                            LOGFN("AP CD RAM: signature found at 0x{:X}",
+                                static_cast<uint32_t>(found[i]));
+
+                        cdPreviousMatches = found;
+                        cdInitialized = true;
+                    }
+                }
+            }
+        }
+        // AP DEBUG : lecture seule des changements dans SSaveData.
+        {
+            constexpr size_t AP_SAVE_SIZE = sizeof(SWA::CGameParameter::SSaveData);
+            static uint8_t previous[AP_SAVE_SIZE]{};
+            static const void* previousSaveData = nullptr;
+            static bool initialized = false;
+            static uint32_t counter = 0;
+
+            auto* appDoc = SWA::CApplicationDocument::GetInstance();
+            auto* gameParam = (appDoc && appDoc->m_pMember)
+                ? appDoc->m_pMember->m_spGameParameter.get()
+                : nullptr;
+            auto* saveData = gameParam ? gameParam->m_pSaveData.get() : nullptr;
+
+            if (!saveData) {
+                initialized = false;
+                previousSaveData = nullptr;
+                counter = 0;
+            } else {
+                const auto* current = reinterpret_cast<const uint8_t*>(saveData);
+                if (!initialized || previousSaveData != saveData) {
+                    for (size_t i = 0; i < AP_SAVE_SIZE; ++i)
+                        previous[i] = current[i];
+                    previousSaveData = saveData;
+                    initialized = true;
+                    counter = 0;
+                    LOGFN("AP COLLECTIBLE DEBUG: surveillance active");
+                } else if (++counter >= 60) {
+                    counter = 0;
+                    uint32_t changed = 0;
+                    for (size_t i = 0; i < AP_SAVE_SIZE; ++i) {
+                        if (previous[i] != current[i]) {
+                            if (changed < 40) {
+                                LOGFN(
+                                    "AP COLLECTIBLE RAM: offset 0x{:04X}: {:02X} -> {:02X}",
+                                    static_cast<uint32_t>(i),
+                                    static_cast<uint32_t>(previous[i]),
+                                    static_cast<uint32_t>(current[i])
+                                );
+                            }
+                            ++changed;
+                            previous[i] = current[i];
+                        }
+                    }
+                    if (changed > 0)
+                        LOGFN("AP COLLECTIBLE DEBUG: {} octets modifies", changed);
+                }
+            }
+        }
 
     auto position = reinterpret_cast<be<float>*>(base + ctx.r3.u32);
 
@@ -245,6 +630,29 @@ void ComputeScreenPositionMidAsmHook(PPCRegister& f1, PPCRegister& f2)
     f2.f64 = (f2.f64 / 720.0 * Video::s_viewportHeight - g_aspectRatioOffsetY) / g_aspectRatioScale;
 }
 
+void APHubSunMedalHook(PPCRegister& r5)
+{
+    // AP HUB HOOK TEST
+    static unsigned int apHubCalls = 0;
+    if (++apHubCalls % 300 == 0)
+        LOGFN("[AP HUB HOOK TEST] Calls={}", apHubCalls);
+
+    r5.u64 = APClient::GetSunMedalBonus();
+}
+
+void APHubMoonMedalHook(PPCRegister& r5)
+{
+    r5.u64 = APClient::GetMoonMedalBonus();
+}
+void APWorldMapSunMedalHook(PPCRegister& r6)
+{
+    r6.u64 = APClient::GetSunMedalBonus();
+}
+
+void APWorldMapMoonMedalHook(PPCRegister& r6)
+{
+    r6.u64 = APClient::GetMoonMedalBonus();
+}
 void WorldMapInfoMidAsmHook(PPCRegister& r4)
 {
     // Prevent the game from snapping "cts_parts_sun_moon"
@@ -1352,17 +1760,18 @@ static double ComputeObjGetItemX(uint32_t type)
     return 0.0;
 }
 
-// SWA::CObjGetItem::GetX
+ // SWA::CObjGetItem::GetX
 PPC_FUNC_IMPL(__imp__sub_82690660);
 PPC_FUNC(sub_82690660)
 {
+    uint32_t type = PPC_LOAD_U32(ctx.r3.u32 + 0xE8);
+
     if (Config::AspectRatio == EAspectRatio::OriginalNarrow)
     {
         __imp__sub_82690660(ctx, base);
         return;
     }
 
-    uint32_t type = PPC_LOAD_U32(ctx.r3.u32 + 0xE8);
     ctx.f1.f64 = ComputeObjGetItemX(type);
 }
 
@@ -1686,3 +2095,1681 @@ void EndingTextPositionMidAsmHook(PPCRegister& r31, PPCRegister& f13)
     else if (align == ALIGN_LEFT)
         f13.f64 += 133.0 * (1.0 - g_aspectRatioNarrowScale);
 }
+
+// AP TEST - Reception evenement GetItem
+PPC_FUNC_IMPL(__imp__sub_8268B0D8);
+PPC_FUNC(sub_8268B0D8)
+{
+    __imp__sub_8268B0D8(ctx, base);
+
+}
+
+// AP TEST - libcurl WebSocket support
+static void AP_TestCurlWebSocket()
+{
+    const curl_version_info_data* info =
+        curl_version_info(CURLVERSION_NOW);
+
+    if (!info)
+    {
+        LOGFN("AP CURL: version info unavailable");
+        return;
+    }
+
+    LOGFN("AP CURL VERSION: {}", info->version);
+
+    bool ws = false;
+    bool wss = false;
+
+    if (info->protocols)
+    {
+        for (const char* const* protocol = info->protocols;
+             *protocol != nullptr; ++protocol)
+        {
+            if (std::strcmp(*protocol, "ws") == 0)
+                ws = true;
+
+            if (std::strcmp(*protocol, "wss") == 0)
+                wss = true;
+        }
+    }
+
+    LOGFN("AP CURL WEBSOCKET: ws={} wss={}", ws, wss);
+}
+
+// AP TEST - Exact internal medal ID -> Archipelago location ID mapping.
+// Generated from sonic_unleashed_370_test.apworld / internal_to_id.
+// Indices 0..N-1 are still provisional for stages not individually verified.
+static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
+    {"Town_Mykonos_Moon_0", 88000003},
+    {"Town_Mykonos_Moon_1", 88000004},
+    {"Town_Mykonos_Night_Sun_0", 88000005},
+    {"Town_Mykonos_Night_Sun_1", 88000006},
+    {"Town_MykonosETF_Sun_0", 88000007},
+    {"Town_MykonosETF_Sun_1", 88000008},
+    {"Town_MykonosETF_Moon_0", 88000009},
+    {"Town_MykonosETF_Moon_1", 88000010},
+    {"Town_MykonosETF_Night_Sun_0", 88000011},
+    {"Town_MykonosETF_Night_Sun_1", 88000012},
+    {"Town_MykonosETF_Night_Moon_0", 88000013},
+    {"Town_MykonosETF_Night_Moon_1", 88000014},
+    {"ActD_MykonosAct2_Sun_0", 88000001},
+    {"ActD_MykonosAct2_Sun_1", 88000015},
+    {"ActD_MykonosAct2_Sun_2", 88000016},
+    {"ActD_MykonosAct2_Moon_0", 88000017},
+    {"ActD_MykonosAct2_Moon_1", 88000018},
+    {"ActD_MykonosAct2_Moon_2", 88000019},
+    {"ActD_MykonosAct2_Moon_3", 88000020},
+    {"ActD_MykonosAct2_Moon_4", 88000021},
+    {"ActD_MykonosAct2_Moon_5", 88000022},
+    {"ActD_MykonosAct2_Moon_6", 88000023},
+    {"ActD_SubMykonos_01_Sun_0", 88000024},
+    {"ActD_SubMykonos_01_Moon_0", 88000025},
+    {"ActD_SubMykonos_01_Moon_1", 88000026},
+    {"ActN_MykonosEvil_Sun_0", 88000027},
+    {"ActN_MykonosEvil_Sun_1", 88000028},
+    {"ActN_MykonosEvil_Sun_2", 88000029},
+    {"ActN_MykonosEvil_Sun_3", 88000030},
+    {"ActN_MykonosEvil_Sun_4", 88000031},
+    {"ActN_MykonosEvil_Sun_5", 88000032},
+    {"ActN_MykonosEvil_Sun_6", 88000033},
+    {"ActN_MykonosEvil_Sun_7", 88000034},
+    {"ActN_MykonosEvil_Sun_8", 88000035},
+    {"ActN_MykonosEvil_Sun_9", 88000036},
+    {"ActN_MykonosEvil_Moon_0", 88000037},
+    {"ActN_MykonosEvil_Moon_1", 88000038},
+    {"ActN_MykonosEvil_Moon_2", 88000039},
+    {"ActN_MykonosEvil_Moon_3", 88000040},
+    {"ActN_MykonosEvil_Moon_4", 88000041},
+    {"ActN_MykonosEvil_Moon_5", 88000002},
+    {"ActN_Mission_Mykonos_Sun_0", 88000042},
+    {"ActN_SubMykonos_01_Sun_0", 88000043},
+    {"ActN_SubMykonos_01_Sun_1", 88000044},
+    {"ActN_SubMykonos_01_Sun_2", 88000045},
+    {"ActN_SubMykonos_01_Sun_3", 88000046},
+    {"ActN_SubMykonos_01_Moon_0", 88000047},
+    {"Town_EuropeanCity_Moon_0", 88000048},
+    {"Town_EuropeanCity_Moon_1", 88000049},
+    {"Town_EuropeanCity_Moon_2", 88000050},
+    {"Town_EuropeanCity_Moon_3", 88000051},
+    {"Town_EuropeanCity_Night_Sun_0", 88000052},
+    {"Town_EuropeanCity_Night_Sun_1", 88000053},
+    {"Town_EuropeanCity_Night_Sun_2", 88000054},
+    {"Town_EuropeanCity_Night_Sun_3", 88000055},
+    {"Town_EuropeanCityETF_Sun_0", 88000056},
+    {"Town_EuropeanCityETF_Sun_1", 88000057},
+    {"Town_EuropeanCityETF_Moon_0", 88000058},
+    {"Town_EuropeanCityETF_Moon_1", 88000059},
+    {"Town_EuropeanCityETF_Night_Sun_0", 88000060},
+    {"Town_EuropeanCityETF_Night_Sun_1", 88000061},
+    {"Town_EuropeanCityETF_Night_Moon_0", 88000062},
+    {"Town_EuropeanCityETF_Night_Moon_1", 88000063},
+    {"ActD_EU_Sun_0", 88000064},
+    {"ActD_EU_Sun_1", 88000065},
+    {"ActD_EU_Sun_2", 88000066},
+    {"ActD_EU_Moon_0", 88000067},
+    {"ActD_EU_Moon_1", 88000068},
+    {"ActD_EU_Moon_2", 88000069},
+    {"ActD_EU_Moon_3", 88000070},
+    {"ActD_EU_Moon_4", 88000071},
+    {"ActD_EU_Moon_5", 88000072},
+    {"ActD_EU_Moon_6", 88000073},
+    {"BossEggRayBird_Sun_0", 88000074},
+    {"BossEggRayBird_Sun_1", 88000075},
+    {"BossEggRayBird_Moon_0", 88000076},
+    {"BossEggRayBird_Moon_1", 88000077},
+    {"BossEggRayBird_Moon_2", 88000078},
+    {"ActN_EUEvil_Sun_0", 88000079},
+    {"ActN_EUEvil_Sun_1", 88000080},
+    {"ActN_EUEvil_Sun_2", 88000081},
+    {"ActN_EUEvil_Sun_3", 88000082},
+    {"ActN_EUEvil_Sun_4", 88000083},
+    {"ActN_EUEvil_Sun_5", 88000084},
+    {"ActN_EUEvil_Sun_6", 88000085},
+    {"ActN_EUEvil_Sun_7", 88000086},
+    {"ActN_EUEvil_Sun_8", 88000087},
+    {"ActN_EUEvil_Sun_9", 88000088},
+    {"ActN_EUEvil_Moon_0", 88000089},
+    {"ActN_EUEvil_Moon_1", 88000090},
+    {"ActN_EUEvil_Moon_2", 88000091},
+    {"ActN_EUEvil_Moon_3", 88000092},
+    {"ActN_EUEvil_Moon_4", 88000093},
+    {"ActN_EUEvil_Moon_5", 88000094},
+    {"Town_Africa_Moon_0", 88000095},
+    {"Town_Africa_Moon_1", 88000096},
+    {"Town_Africa_Night_Sun_0", 88000097},
+    {"Town_Africa_Night_Sun_1", 88000098},
+    {"Town_AfricaETF_Sun_0", 88000099},
+    {"Town_AfricaETF_Sun_1", 88000100},
+    {"Town_AfricaETF_Moon_0", 88000101},
+    {"Town_AfricaETF_Moon_1", 88000102},
+    {"Town_AfricaETF_Night_Sun_0", 88000103},
+    {"Town_AfricaETF_Night_Sun_1", 88000104},
+    {"Town_AfricaETF_Night_Moon_0", 88000105},
+    {"Town_AfricaETF_Night_Moon_1", 88000106},
+    {"ActD_Africa_Sun_0", 88000107},
+    {"ActD_Africa_Sun_1", 88000108},
+    {"ActD_Africa_Sun_2", 88000109},
+    {"ActD_Africa_Moon_0", 88000110},
+    {"ActD_Africa_Moon_1", 88000111},
+    {"ActD_Africa_Moon_2", 88000112},
+    {"ActD_Africa_Moon_3", 88000113},
+    {"ActD_Africa_Moon_4", 88000114},
+    {"ActD_Africa_Moon_5", 88000115},
+    {"ActD_Africa_Moon_6", 88000116},
+    {"BossEggBeetle_Sun_0", 88000117},
+    {"BossEggBeetle_Sun_1", 88000118},
+    {"BossEggBeetle_Moon_0", 88000119},
+    {"BossEggBeetle_Moon_1", 88000120},
+    {"BossEggBeetle_Moon_2", 88000121},
+    {"ActN_AfricaEvil_Sun_0", 88000122},
+    {"ActN_AfricaEvil_Sun_1", 88000123},
+    {"ActN_AfricaEvil_Sun_2", 88000124},
+    {"ActN_AfricaEvil_Sun_3", 88000125},
+    {"ActN_AfricaEvil_Sun_4", 88000126},
+    {"ActN_AfricaEvil_Sun_5", 88000127},
+    {"ActN_AfricaEvil_Sun_6", 88000128},
+    {"ActN_AfricaEvil_Sun_7", 88000129},
+    {"ActN_AfricaEvil_Sun_8", 88000130},
+    {"ActN_AfricaEvil_Sun_9", 88000131},
+    {"ActN_AfricaEvil_Moon_0", 88000132},
+    {"ActN_AfricaEvil_Moon_1", 88000133},
+    {"ActN_AfricaEvil_Moon_2", 88000134},
+    {"ActN_AfricaEvil_Moon_3", 88000135},
+    {"ActN_AfricaEvil_Moon_4", 88000136},
+    {"ActN_AfricaEvil_Moon_5", 88000137},
+    {"Town_China_Moon_0", 88000138},
+    {"Town_China_Moon_1", 88000139},
+    {"Town_China_Night_Sun_0", 88000140},
+    {"Town_China_Night_Sun_1", 88000141},
+    {"Town_ChinaETF_Sun_0", 88000142},
+    {"Town_ChinaETF_Sun_1", 88000143},
+    {"Town_ChinaETF_Moon_0", 88000144},
+    {"Town_ChinaETF_Moon_1", 88000145},
+    {"Town_ChinaETF_Night_Sun_0", 88000146},
+    {"Town_ChinaETF_Night_Sun_1", 88000147},
+    {"Town_ChinaETF_Night_Moon_0", 88000148},
+    {"Town_ChinaETF_Night_Moon_1", 88000149},
+    {"ActD_China_Sun_0", 88000150},
+    {"ActD_China_Sun_1", 88000151},
+    {"ActD_China_Sun_2", 88000152},
+    {"ActD_China_Moon_0", 88000153},
+    {"ActD_China_Moon_1", 88000154},
+    {"ActD_China_Moon_2", 88000155},
+    {"ActD_China_Moon_3", 88000156},
+    {"ActD_China_Moon_4", 88000157},
+    {"ActD_China_Moon_5", 88000158},
+    {"ActD_China_Moon_6", 88000159},
+    {"ActD_SubChina_03_Sun_0", 88000160},
+    {"ActD_SubChina_03_Moon_0", 88000161},
+    {"ActD_SubChina_03_Moon_1", 88000162},
+    {"ActD_SubChina_04_Sun_0", 88000163},
+    {"ActD_SubChina_04_Moon_0", 88000164},
+    {"ActD_SubChina_04_Moon_1", 88000165},
+    {"ActN_ChinaEvil_Sun_0", 88000166},
+    {"ActN_ChinaEvil_Sun_1", 88000167},
+    {"ActN_ChinaEvil_Sun_2", 88000168},
+    {"ActN_ChinaEvil_Sun_3", 88000169},
+    {"ActN_ChinaEvil_Sun_4", 88000170},
+    {"ActN_ChinaEvil_Sun_5", 88000171},
+    {"ActN_ChinaEvil_Sun_6", 88000172},
+    {"ActN_ChinaEvil_Sun_7", 88000173},
+    {"ActN_ChinaEvil_Sun_8", 88000174},
+    {"ActN_ChinaEvil_Sun_9", 88000175},
+    {"ActN_ChinaEvil_Moon_0", 88000176},
+    {"ActN_ChinaEvil_Moon_1", 88000177},
+    {"ActN_ChinaEvil_Moon_2", 88000178},
+    {"ActN_ChinaEvil_Moon_3", 88000179},
+    {"ActN_ChinaEvil_Moon_4", 88000180},
+    {"ActN_ChinaEvil_Moon_5", 88000181},
+    {"ActN_SubChina_01_Sun_0", 88000182},
+    {"ActN_SubChina_01_Sun_1", 88000183},
+    {"ActN_SubChina_01_Sun_2", 88000184},
+    {"ActN_SubChina_01_Sun_3", 88000185},
+    {"ActN_SubChina_01_Moon_0", 88000186},
+    {"BossPhoenix_Sun_0", 88000187},
+    {"BossPhoenix_Sun_1", 88000188},
+    {"BossPhoenix_Sun_2", 88000189},
+    {"BossPhoenix_Moon_0", 88000190},
+    {"BossPhoenix_Moon_1", 88000191},
+    {"Town_Snow_Moon_0", 88000192},
+    {"Town_Snow_Moon_1", 88000193},
+    {"Town_Snow_Night_Sun_0", 88000194},
+    {"Town_Snow_Night_Sun_1", 88000195},
+    {"Town_SnowETF_Sun_0", 88000196},
+    {"Town_SnowETF_Sun_1", 88000197},
+    {"Town_SnowETF_Moon_0", 88000198},
+    {"Town_SnowETF_Moon_1", 88000199},
+    {"Town_SnowETF_Night_Sun_0", 88000200},
+    {"Town_SnowETF_Night_Sun_1", 88000201},
+    {"Town_SnowETF_Night_Moon_0", 88000202},
+    {"Town_SnowETF_Night_Moon_1", 88000203},
+    {"ActD_Snow_Sun_0", 88000204},
+    {"ActD_Snow_Sun_1", 88000205},
+    {"ActD_Snow_Sun_2", 88000206},
+    {"ActD_Snow_Moon_0", 88000207},
+    {"ActD_Snow_Moon_1", 88000208},
+    {"ActD_Snow_Moon_2", 88000209},
+    {"ActD_Snow_Moon_3", 88000210},
+    {"ActD_Snow_Moon_4", 88000211},
+    {"ActD_Snow_Moon_5", 88000212},
+    {"ActD_Snow_Moon_6", 88000213},
+    {"ActD_SubSnow_01_Sun_0", 88000214},
+    {"ActD_SubSnow_01_Moon_0", 88000215},
+    {"ActD_SubSnow_01_Moon_1", 88000216},
+    {"ActN_SnowEvil_Sun_0", 88000217},
+    {"ActN_SnowEvil_Sun_1", 88000218},
+    {"ActN_SnowEvil_Sun_2", 88000219},
+    {"ActN_SnowEvil_Sun_3", 88000220},
+    {"ActN_SnowEvil_Sun_4", 88000221},
+    {"ActN_SnowEvil_Sun_5", 88000222},
+    {"ActN_SnowEvil_Sun_6", 88000223},
+    {"ActN_SnowEvil_Sun_7", 88000224},
+    {"ActN_SnowEvil_Sun_8", 88000225},
+    {"ActN_SnowEvil_Sun_9", 88000226},
+    {"ActN_SnowEvil_Moon_0", 88000227},
+    {"ActN_SnowEvil_Moon_1", 88000228},
+    {"ActN_SnowEvil_Moon_2", 88000229},
+    {"ActN_SnowEvil_Moon_3", 88000230},
+    {"ActN_SnowEvil_Moon_4", 88000231},
+    {"ActN_SnowEvil_Moon_5", 88000232},
+    {"BossDarkGaiaMoray_Sun_0", 88000233},
+    {"BossDarkGaiaMoray_Sun_1", 88000234},
+    {"BossDarkGaiaMoray_Sun_2", 88000235},
+    {"BossDarkGaiaMoray_Moon_0", 88000236},
+    {"BossDarkGaiaMoray_Moon_1", 88000237},
+    {"Town_PetraCapital_Moon_0", 88000238},
+    {"Town_PetraCapital_Moon_1", 88000239},
+    {"Town_PetraCapital_Moon_2", 88000240},
+    {"Town_PetraCapital_Moon_3", 88000241},
+    {"Town_PetraCapital_Night_Sun_0", 88000242},
+    {"Town_PetraCapital_Night_Sun_1", 88000243},
+    {"Town_PetraCapital_Night_Sun_2", 88000244},
+    {"Town_PetraCapital_Night_Sun_3", 88000245},
+    {"Town_PetraCapitalETF_Sun_0", 88000246},
+    {"Town_PetraCapitalETF_Sun_1", 88000247},
+    {"Town_PetraCapitalETF_Moon_0", 88000248},
+    {"Town_PetraCapitalETF_Moon_1", 88000249},
+    {"Town_PetraCapitalETF_Night_Sun_0", 88000250},
+    {"Town_PetraCapitalETF_Night_Sun_1", 88000251},
+    {"Town_PetraCapitalETF_Night_Moon_0", 88000252},
+    {"Town_PetraCapitalETF_Night_Moon_1", 88000253},
+    {"ActD_Petra_Sun_0", 88000254},
+    {"ActD_Petra_Sun_1", 88000255},
+    {"ActD_Petra_Sun_2", 88000256},
+    {"ActD_Petra_Moon_0", 88000257},
+    {"ActD_Petra_Moon_1", 88000258},
+    {"ActD_Petra_Moon_2", 88000259},
+    {"ActD_Petra_Moon_3", 88000260},
+    {"ActD_Petra_Moon_4", 88000261},
+    {"ActD_Petra_Moon_5", 88000262},
+    {"ActD_Petra_Moon_6", 88000263},
+    {"ActN_PetraEvil_Sun_0", 88000264},
+    {"ActN_PetraEvil_Sun_1", 88000265},
+    {"ActN_PetraEvil_Sun_2", 88000266},
+    {"ActN_PetraEvil_Sun_3", 88000267},
+    {"ActN_PetraEvil_Sun_4", 88000268},
+    {"ActN_PetraEvil_Sun_5", 88000269},
+    {"ActN_PetraEvil_Sun_6", 88000270},
+    {"ActN_PetraEvil_Sun_7", 88000271},
+    {"ActN_PetraEvil_Sun_8", 88000272},
+    {"ActN_PetraEvil_Sun_9", 88000273},
+    {"ActN_PetraEvil_Moon_0", 88000274},
+    {"ActN_PetraEvil_Moon_1", 88000275},
+    {"ActN_PetraEvil_Moon_2", 88000276},
+    {"ActN_PetraEvil_Moon_3", 88000277},
+    {"ActN_PetraEvil_Moon_4", 88000278},
+    {"ActN_PetraEvil_Moon_5", 88000279},
+    {"BossPetra_Sun_0", 88000280},
+    {"BossPetra_Sun_1", 88000281},
+    {"BossPetra_Sun_2", 88000282},
+    {"BossPetra_Moon_0", 88000283},
+    {"BossPetra_Moon_1", 88000284},
+    {"Town_NYCity_Moon_0", 88000285},
+    {"Town_NYCity_Moon_1", 88000286},
+    {"Town_NYCity_Night_Sun_0", 88000287},
+    {"Town_NYCity_Night_Sun_1", 88000288},
+    {"Town_NYCityETF_Sun_0", 88000289},
+    {"Town_NYCityETF_Sun_1", 88000290},
+    {"Town_NYCityETF_Moon_0", 88000291},
+    {"Town_NYCityETF_Moon_1", 88000292},
+    {"Town_NYCityETF_Night_Sun_0", 88000293},
+    {"Town_NYCityETF_Night_Sun_1", 88000294},
+    {"Town_NYCityETF_Night_Moon_0", 88000295},
+    {"Town_NYCityETF_Night_Moon_1", 88000296},
+    {"ActD_NY_Sun_0", 88000297},
+    {"ActD_NY_Sun_1", 88000298},
+    {"ActD_NY_Sun_2", 88000299},
+    {"ActD_NY_Moon_0", 88000300},
+    {"ActD_NY_Moon_1", 88000301},
+    {"ActD_NY_Moon_2", 88000302},
+    {"ActD_NY_Moon_3", 88000303},
+    {"ActD_NY_Moon_4", 88000304},
+    {"ActD_NY_Moon_5", 88000305},
+    {"ActD_NY_Moon_6", 88000306},
+    {"ActN_NYEvil_Sun_0", 88000307},
+    {"ActN_NYEvil_Sun_1", 88000308},
+    {"ActN_NYEvil_Sun_2", 88000309},
+    {"ActN_NYEvil_Sun_3", 88000310},
+    {"ActN_NYEvil_Sun_4", 88000311},
+    {"ActN_NYEvil_Sun_5", 88000312},
+    {"ActN_NYEvil_Sun_6", 88000313},
+    {"ActN_NYEvil_Sun_7", 88000314},
+    {"ActN_NYEvil_Sun_8", 88000315},
+    {"ActN_NYEvil_Sun_9", 88000316},
+    {"ActN_NYEvil_Moon_0", 88000317},
+    {"ActN_NYEvil_Moon_1", 88000318},
+    {"ActN_NYEvil_Moon_2", 88000319},
+    {"ActN_NYEvil_Moon_3", 88000320},
+    {"ActN_NYEvil_Moon_4", 88000321},
+    {"ActN_NYEvil_Moon_5", 88000322},
+    {"Town_SouthEastAsia_Moon_0", 88000323},
+    {"Town_SouthEastAsia_Moon_1", 88000324},
+    {"Town_SouthEastAsia_Night_Sun_0", 88000325},
+    {"Town_SouthEastAsia_Night_Sun_1", 88000326},
+    {"Town_SouthEastAsiaETF_Sun_0", 88000327},
+    {"Town_SouthEastAsiaETF_Sun_1", 88000328},
+    {"Town_SouthEastAsiaETF_Moon_0", 88000329},
+    {"Town_SouthEastAsiaETF_Moon_1", 88000330},
+    {"Town_SouthEastAsiaETF_Night_Sun_0", 88000331},
+    {"Town_SouthEastAsiaETF_Night_Sun_1", 88000332},
+    {"Town_SouthEastAsiaETF_Night_Moon_0", 88000333},
+    {"Town_SouthEastAsiaETF_Night_Moon_1", 88000334},
+    {"ActD_Beach_Sun_0", 88000335},
+    {"ActD_Beach_Sun_1", 88000336},
+    {"ActD_Beach_Sun_2", 88000337},
+    {"ActD_Beach_Moon_0", 88000338},
+    {"ActD_Beach_Moon_1", 88000339},
+    {"ActD_Beach_Moon_2", 88000340},
+    {"ActD_Beach_Moon_3", 88000341},
+    {"ActD_Beach_Moon_4", 88000342},
+    {"ActD_Beach_Moon_5", 88000343},
+    {"ActD_Beach_Moon_6", 88000344},
+    {"BossEggLancer_Sun_0", 88000345},
+    {"BossEggLancer_Sun_1", 88000346},
+    {"BossEggLancer_Moon_0", 88000347},
+    {"BossEggLancer_Moon_1", 88000348},
+    {"BossEggLancer_Moon_2", 88000349},
+    {"ActN_BeachEvil_Sun_0", 88000350},
+    {"ActN_BeachEvil_Sun_1", 88000351},
+    {"ActN_BeachEvil_Sun_2", 88000352},
+    {"ActN_BeachEvil_Sun_3", 88000353},
+    {"ActN_BeachEvil_Sun_4", 88000354},
+    {"ActN_BeachEvil_Sun_5", 88000355},
+    {"ActN_BeachEvil_Sun_6", 88000356},
+    {"ActN_BeachEvil_Sun_7", 88000357},
+    {"ActN_BeachEvil_Sun_8", 88000358},
+    {"ActN_BeachEvil_Sun_9", 88000359},
+    {"ActN_BeachEvil_Moon_0", 88000360},
+    {"ActN_BeachEvil_Moon_1", 88000361},
+    {"ActN_BeachEvil_Moon_2", 88000362},
+    {"ActN_BeachEvil_Moon_3", 88000363},
+    {"ActN_BeachEvil_Moon_4", 88000364},
+    {"ActN_BeachEvil_Moon_5", 88000365},
+    {"ActN_SubBeach_01_Sun_0", 88000366},
+    {"ActN_SubBeach_01_Sun_1", 88000367},
+    {"ActN_SubBeach_01_Sun_2", 88000368},
+    {"ActN_SubBeach_01_Sun_3", 88000369},
+    {"ActN_SubBeach_01_Moon_0", 88000370},
+};
+
+// AP ACT CLEAR + RANK CHECKS (61-stage server test).
+// All 370 medal locations are unchanged. Stage metadata is in ap_stage_registry.h.
+static std::string apRankLastStage;
+static std::unordered_map<uint32_t, uint32_t> apRankPreviouslyReadByObject;
+
+static void AP_RememberRankStage(const std::string& stage)
+{
+    if (apRankActLocations.find(stage) == apRankActLocations.end())
+    {
+        // Never attribute a result to a previously played act.
+        if (!apRankLastStage.empty())
+        {
+            LOGFN("AP RANK STAGE UNKNOWN: {} (clearing {})", stage, apRankLastStage);
+            apRankLastStage.clear();
+        }
+        return;
+    }
+
+    if (stage != apRankLastStage)
+    {
+        apRankLastStage = stage;
+        LOGFN("AP RANK STAGE REMEMBERED: {}", stage);
+    }
+}
+
+// The game returns 5 for an Act without a recorded rank.
+PPC_FUNC_IMPL(__imp__sub_8251B7A8);
+PPC_FUNC(sub_8251B7A8)
+{
+    const uint32_t object = ctx.r3.u32;
+    __imp__sub_8251B7A8(ctx, base);
+
+    if (object != 0 && ctx.r3.u32 <= 5)
+        apRankPreviouslyReadByObject[object] = ctx.r3.u32;
+}
+
+// Invoked by the results logic when a new best rank is written.
+PPC_FUNC_IMPL(__imp__sub_8251C618);
+PPC_FUNC(sub_8251C618)
+{
+    const uint32_t object = ctx.r3.u32;
+    const uint32_t newRank = ctx.r4.u32;
+    const auto oldEntry = apRankPreviouslyReadByObject.find(object);
+    const bool hasOldRank = oldEntry != apRankPreviouslyReadByObject.end();
+    const uint32_t oldRank = hasOldRank ? oldEntry->second : 999;
+
+    // Never change the original game's rank update behavior.
+    __imp__sub_8251C618(ctx, base);
+
+    const auto act = apRankActLocations.find(apRankLastStage);
+    if (act == apRankActLocations.end())
+        return;
+
+    if (!hasOldRank || oldRank > 5 || newRank > 4)
+    {
+        LOGFN("AP RANK DIAG: stage={} object={} oldKnown={} old={} new={}",
+            apRankLastStage, object, hasOldRank, oldRank, newRank);
+        return;
+    }
+
+    LOGFN("AP RANK DIAG: stage={} old={} new={}", apRankLastStage, oldRank, newRank);
+    const auto& locations = act->second;
+
+    if (oldRank == 5)
+    {
+        LOGFN("AP CLEAR: {} - {}", locations.displayName, locations.clearLabel);
+        APClient::QueueLocationCheck(locations.actClear);
+    }
+
+    const uint32_t thresholds[] = {4, 3, 2, 1};
+    const uint32_t ids[] = {locations.rankD, locations.rankC, locations.rankB, locations.rankA};
+    const char* labels[] = {"D", "C", "B", "A"};
+
+    for (size_t i = 0; i < 4; ++i)
+    {
+        if (oldRank > thresholds[i] && newRank <= thresholds[i])
+        {
+            LOGFN("AP RANK CHECK: {} - Rank {}", locations.displayName, labels[i]);
+            APClient::QueueLocationCheck(ids[i]);
+        }
+    }
+
+    apRankPreviouslyReadByObject[object] = newRank;
+}
+
+// AP TEST - Medal event + Stage ID + Anti-duplicates
+static std::unordered_set<std::string> apCollectedMedals;
+
+PPC_FUNC_IMPL(__imp__sub_8268AC88);
+PPC_FUNC(sub_8268AC88)
+{
+
+static bool apCurlTestDone = false;
+
+if (!apCurlTestDone)
+{
+    apCurlTestDone = true;
+    AP_TestCurlWebSocket();
+}
+    uint32_t object = ctx.r3.u32;
+
+    if (object != 0)
+    {
+        uint32_t type = PPC_LOAD_U32(object + 232);
+        uint32_t extra = PPC_LOAD_U32(object + 236);
+
+        if (type <= 1)
+        {
+            if (auto pGameDocument = SWA::CGameDocument::GetInstance())
+            {
+                auto member = pGameDocument->m_pMember;
+
+                if (member && !member->m_StageName.empty())
+                {
+                    const std::string stage = member->m_StageName.c_str();
+                    AP_RememberRankStage(stage);
+                    const std::string medalType =
+                        (type == 0) ? "Moon" : "Sun";
+
+                    const std::string checkID =
+                        stage + "_" + medalType + "_" +
+                        std::to_string(extra);
+
+                    auto result = apCollectedMedals.insert(checkID);
+
+                   
+if (result.second)
+{
+    LOGFN("AP CHECK NEW: {}", checkID);
+
+    const auto location = apMedalLocationIds.find(checkID);
+    if (location != apMedalLocationIds.end())
+    {
+        APClient::QueueLocationCheck(location->second);
+        LOGFN("AP LOCATION QUEUED: {} -> {}", checkID, location->second);
+    }
+    else
+    {
+        LOGFN("AP LOCATION UNKNOWN: {}", checkID);
+    }
+}
+else
+{
+    LOGFN("AP CHECK DUPLICATE: {}", checkID);
+}
+                }
+                else
+                {
+                    LOGFN("AP CHECK: stage unavailable");
+                }
+            }
+        }
+    }
+
+    __imp__sub_8268AC88(ctx, base);
+}
+
+// AP TEST - Detect medals before pickup
+static std::unordered_set<std::string> apDetectedMedals;
+
+PPC_FUNC_IMPL(__imp__sub_8268A788);
+PPC_FUNC(sub_8268A788)
+{
+    // Save the original object pointer BEFORE calling the function.
+    const uint32_t object = ctx.r3.u32;
+
+// AP DEBUG - Save initialization arguments
+const uint32_t apArg4 = ctx.r4.u32;
+const uint32_t apArg5 = ctx.r5.u32;
+const uint32_t apArg6 = ctx.r6.u32;
+
+    static uint32_t callCount = 0;
+    ++callCount;
+
+    if (callCount <= 10)
+    {
+        LOGFN("AP INIT HOOK CALLED: count={} object={}",
+            callCount, object);
+    }
+
+    // Let the game initialize the object normally.
+    const uint32_t apTypeBefore = PPC_LOAD_U32(object + 232);
+    const uint32_t apIndexBefore = PPC_LOAD_U32(object + 236);
+    __imp__sub_8268A788(ctx, base);
+
+    if (object == 0)
+        return;
+
+    const uint32_t type = PPC_LOAD_U32(object + 232);
+    const uint32_t index = PPC_LOAD_U32(object + 236);
+    LOGFN("AP MEDAL BEFORE/AFTER: type {} to {} index {} to {}", apTypeBefore, type, apIndexBefore, index);
+
+LOGFN("AP MEDAL DEBUG: object={} type={} index={} r4={} r5={} r6={}",
+    object, type, index, apArg4, apArg5, apArg6);
+
+    if (type > 1 || index > 31)
+        return;
+
+    auto pGameDocument = SWA::CGameDocument::GetInstance();
+
+    if (!pGameDocument || !pGameDocument->m_pMember)
+        return;
+
+    const std::string stage =
+        pGameDocument->m_pMember->m_StageName.c_str();
+
+    if (stage.empty())
+        return;
+
+    AP_RememberRankStage(stage);
+
+    const std::string medalType =
+        (type == 0) ? "Moon" : "Sun";
+
+    const std::string medalID =
+        stage + "_" + medalType + "_" + std::to_string(index);
+
+    if (apDetectedMedals.insert(medalID).second)
+    {
+        LOGFN("AP MEDAL DETECTED: {}", medalID);
+    }
+}
+
+// AP TEST - Medal constructor
+PPC_FUNC_IMPL(__imp__sub_8268A608);
+
+PPC_FUNC(sub_8268A608)
+{
+    const uint32_t object = ctx.r3.u32;
+    const uint32_t constructorType = ctx.r4.u32;
+
+    __imp__sub_8268A608(ctx, base);
+
+    if (object == 0)
+        return;
+
+    const uint32_t type = PPC_LOAD_U32(object + 232);
+    const uint32_t index = PPC_LOAD_U32(object + 236);
+
+    LOGFN("AP MEDAL CONSTRUCTOR: object={} argType={} type={} index={}",
+        object, constructorType, type, index);
+}
+// AP DEBUG - Medal progression requirement check
+PPC_FUNC_IMPL(__imp__sub_8273EFC0);
+PPC_FUNC(sub_8273EFC0)
+{
+    const uint32_t object = ctx.r3.u32;
+
+    uint32_t requirementType = 0;
+    uint32_t requiredLevel = 0;
+
+    if (object != 0)
+    {
+        requirementType = PPC_LOAD_U32(object + 244);
+        requiredLevel = PPC_LOAD_U32(object + 276);
+    }
+
+    __imp__sub_8273EFC0(ctx, base);
+
+    const uint32_t result = ctx.r3.u32;
+
+    LOGFN(
+        "AP MEDAL DEBUG: type={} requiredLevel={} result={}",
+        requirementType,
+        requiredLevel,
+        result
+    );
+}
+
+// AP Progressive Medals - virtual progression level
+PPC_FUNC_IMPL(__imp__sub_8251ACB8);
+PPC_FUNC(sub_8251ACB8)
+{
+    const uint32_t medalType = ctx.r4.u32;
+
+    // Original medal count: 0 = Moon, 1 = Sun.
+    sub_8251AB70(ctx, base);
+
+    const uint32_t physicalCount = ctx.r3.u32;
+
+    uint32_t bonus = 0;
+
+    if (medalType == 0)
+        bonus = APClient::GetMoonMedalBonus();
+    else if (medalType == 1)
+        bonus = APClient::GetSunMedalBonus();
+
+    const uint32_t total = bonus;
+
+    uint32_t level = 1;
+
+    if (total >= 120) level = 7;
+    else if (total >= 80) level = 6;
+    else if (total >= 60) level = 5;
+    else if (total >= 45) level = 4;
+    else if (total >= 30) level = 3;
+    else if (total >= 15) level = 2;
+
+    ctx.r3.u64 = level;
+
+
+}
+
+
+
+
+
+// AP : diagnostic du compteur Rings pendant un Act.
+PPC_FUNC_IMPL(__imp__sub_82321640);
+PPC_FUNC(sub_82321640)
+{
+const auto apRingObject = ctx.r3.u32;
+    __imp__sub_82321640(ctx, base);
+
+    // AP Ring Wipe Trap : Sonic Day.
+    const auto* apDayWipeDoc = SWA::CGameDocument::GetInstance();
+    const char* apDayWipeStage =
+        (apDayWipeDoc && apDayWipeDoc->m_pMember)
+        ? apDayWipeDoc->m_pMember->m_StageName.c_str()
+        : "";
+
+    const bool apDayWipeAllowedStage =
+        std::strncmp(apDayWipeStage, "ActD_", 5) == 0 ||
+        std::strcmp(apDayWipeStage, "BossEggBeetle") == 0 ||
+        std::strcmp(apDayWipeStage, "BossEggLancer") == 0 ||
+        std::strcmp(apDayWipeStage, "BossEggRayBird") == 0;
+
+    if (apRingObject != 0 && apDayWipeAllowedStage)
+    {
+        const auto apCurrentRings =
+            PPC_LOAD_U32(apRingObject + 1336);
+
+        if (apCurrentRings <= 999999 &&
+            APClient::GetPendingRingWipe() > 0)
+        {
+            if (apCurrentRings > 0)
+            {
+                ctx.r3.u32 = apRingObject;
+                ctx.r4.u32 = 0u - apCurrentRings;
+                __imp__sub_82321640(ctx, base);
+            }
+
+            APClient::ConfirmRingWipeApplied();
+            LOGFN("AP RING WIPE APPLIED: SONIC DAY");
+        }
+    }
+
+
+    const auto apRingBonus = APClient::GetPendingRingBonus();
+    if (apRingBonus > 0)
+    {
+        ctx.r3.u32 = apRingObject;
+        ctx.r4.u32 = apRingBonus;
+        __imp__sub_82321640(ctx, base);
+        APClient::ConfirmRingBonusApplied();
+    }
+}
+
+
+
+
+
+
+
+// AP DEBUG : detecter le HUD des Acts Werehog.
+PPC_FUNC_IMPL(__imp__sub_8249DAD0);
+PPC_FUNC(sub_8249DAD0)
+{
+    const uint32_t apHudObject = ctx.r3.u32;
+
+    __imp__sub_8249DAD0(ctx, base);
+
+    static uint32_t apHudUpdateCount = 0;
+    ++apHudUpdateCount;
+
+    if (apHudUpdateCount <= 5 ||
+        apHudUpdateCount % 600 == 0)
+    {
+        LOGFN("AP WEREHOG ACT HUD: count={} hud={:08X}",
+            apHudUpdateCount, apHudObject);
+    }
+}
+// AP Full Ring : restaurer les PV du Werehog dans les Acts de nuit.
+// BEGIN AP_WEREHOG_BURN_DAMAGE_V1
+#include <chrono>
+#include <string>
+#include "ap_werehog_burn_damage.h"
+
+namespace
+{
+    bool apBurnDamageActive = false;
+    uint32_t apBurnDamageStats = 0;
+    unsigned int apBurnDamageTicks = 0;
+    std::string apBurnDamageStage;
+    std::chrono::steady_clock::time_point apBurnDamageStart;
+    std::chrono::steady_clock::time_point apBurnDamageLastCall;
+}
+
+void AP_WerehogBurnStart(uint32_t stats)
+{
+    if (stats == 0)
+        return;
+
+    const auto* doc = SWA::CGameDocument::GetInstance();
+
+    if (!doc || !doc->m_pMember)
+        return;
+
+    const char* stage = doc->m_pMember->m_StageName.c_str();
+
+    if (!stage)
+        return;
+
+    const bool validStage =
+        std::strncmp(stage, "ActN_", 5) == 0 ||
+        std::strcmp(stage, "Act_EggmanLand") == 0 ||
+        std::strcmp(stage, "BossDarkGaiaMoray") == 0 ||
+        std::strcmp(stage, "BossPhoenix") == 0 ||
+        std::strcmp(stage, "BossPetra") == 0 ||
+        std::strcmp(stage, "BossEggDragoon") == 0;
+
+    if (!validStage)
+        return;
+
+    apBurnDamageActive = true;
+    apBurnDamageStats = stats;
+    apBurnDamageTicks = 0;
+    apBurnDamageStage = stage;
+    apBurnDamageStart = std::chrono::steady_clock::now();
+    apBurnDamageLastCall = apBurnDamageStart;
+
+    LOGFN("[AP BURN DAMAGE] Started stats={:08X}", stats);
+}
+// END AP_WEREHOG_BURN_DAMAGE_V1
+
+PPC_FUNC_IMPL(__imp__sub_823C6400);
+PPC_FUNC(sub_823C6400)
+{
+    const uint32_t apWerehogObject = ctx.r3.u32;
+    static unsigned int apClawsHookCount = 0;
+    if (++apClawsHookCount % 60 == 0)
+        {
+    const auto* apTestDoc = SWA::CGameDocument::GetInstance();
+    const char* apTestStage =
+        (apTestDoc && apTestDoc->m_pMember)
+        ? apTestDoc->m_pMember->m_StageName.c_str()
+        : "UNKNOWN";
+
+    LOGFN("AP PLAYABLE CHARACTER: count={} player={:08X} stage={}",
+        apClawsHookCount, apWerehogObject, apTestStage);
+}
+
+    // Executer normalement la mise a jour du jeu.
+    __imp__sub_823C6400(ctx, base);
+
+    const auto* apDoc = SWA::CGameDocument::GetInstance();
+
+    if (!apDoc || !apDoc->m_pMember)
+        return;
+
+    const char* apStageName =
+        apDoc->m_pMember->m_StageName.c_str();
+
+    const bool apAllowedWerehogStage =
+        std::strncmp(apStageName, "ActN_", 5) == 0 ||
+        std::strcmp(apStageName, "BossDarkGaiaMoray") == 0 ||
+        std::strcmp(apStageName, "BossPhoenix") == 0 ||
+        std::strcmp(apStageName, "BossPetra") == 0 ||
+        std::strcmp(apStageName, "BossEggDragoon") == 0 ||
+        std::strcmp(apStageName, "Act_EggmanLand") == 0;
+
+    if (!apAllowedWerehogStage)
+        return;
+
+    if (apWerehogObject == 0)
+        return;
+
+    const uint32_t apStats =
+        PPC_LOAD_U32(apWerehogObject + 196);
+
+    if (apStats == 0)
+        return;
+
+    const uint32_t apCurrentHP =
+        PPC_LOAD_U32(apStats + 1660);
+
+
+
+    // AP WEREHOG DELIVERY DELAY
+    // Attendre 3 secondes avant de distribuer les objets AP.
+    static std::string apDelayStage;
+    static uint32_t apDelayStats = 0;
+    static std::chrono::steady_clock::time_point apDelayStart;
+    static std::chrono::steady_clock::time_point apLastWerehogCall;
+
+    const auto apWerehogNow = std::chrono::steady_clock::now();
+
+    if (apLastWerehogCall.time_since_epoch().count() != 0 &&
+        apWerehogNow - apLastWerehogCall > std::chrono::seconds(1))
+    {
+        apDelayStart = apWerehogNow;
+    }
+
+    apLastWerehogCall = apWerehogNow;
+
+    const std::string apCurrentStage =
+        apDoc->m_pMember->m_StageName.c_str();
+
+    if (apCurrentStage != apDelayStage ||
+        apStats != apDelayStats)
+    {
+        apDelayStage = apCurrentStage;
+        apDelayStats = apStats;
+        apDelayStart = std::chrono::steady_clock::now();
+    }
+
+    if (apCurrentHP == 0)
+    {
+        apDelayStart = std::chrono::steady_clock::now();
+        return;
+    }
+
+    if (std::chrono::steady_clock::now() - apDelayStart <
+        std::chrono::seconds(5))
+    {
+        return;
+    }
+
+    static unsigned int apClawsStatsCount = 0;
+    if (++apClawsStatsCount % 600 == 0)
+        LOGFN("AP CLAWS STATS: stats={:08X} hp={}", apStats, apCurrentHP);
+
+    // AP Dark Gaia Energy : remplir la jauge Unleash.
+    if (apCurrentHP != 0)
+    {
+        const uint32_t apRawEnergy = PPC_LOAD_U32(apStats + 1672);
+        float apEnergy = 0.0f;
+        std::memcpy(&apEnergy, &apRawEnergy, sizeof(apEnergy));
+        if (std::isfinite(apEnergy) && apEnergy >= 0.0f && apEnergy < 99.99f &&
+            APClient::GetPendingDarkGaiaEnergy() != 0)
+        {
+            auto apEnergyCtx = ctx;
+            ctx.r3.u32 = apStats;
+            ctx.f1.f64 = 100000.0;
+            sub_823AF7A8(ctx, base);
+            const uint32_t apRawNewEnergy = PPC_LOAD_U32(apStats + 1672);
+            float apNewEnergy = 0.0f;
+            std::memcpy(&apNewEnergy, &apRawNewEnergy, sizeof(apNewEnergy));
+            ctx = apEnergyCtx;
+            if (std::isfinite(apNewEnergy) && apNewEnergy >= 99.99f)
+            {
+                APClient::ConfirmDarkGaiaEnergyApplied();
+                LOGFN("AP DARK GAIA ENERGY APPLIED: {} -> {}", apEnergy, apNewEnergy);
+            }
+            else
+            {
+                APClient::CancelDarkGaiaEnergy();
+                LOGFN("AP DARK GAIA ENERGY WARNING: {} -> {}", apEnergy, apNewEnergy);
+            }
+        }
+    }
+
+    // AP Super Claws : attendre la creation de l'effet natif.
+    static bool apClawsWaitingForEffect = false;
+    static uint32_t apClawsPreviousStats = 0;
+    static unsigned int apClawsWaitFrames = 0;
+
+    if (apClawsWaitingForEffect)
+    {
+        const uint32_t apEffect =
+            (apStats == apClawsPreviousStats)
+                ? PPC_LOAD_U32(apStats + 1136) : 0;
+
+        const uint32_t apTimerRaw = PPC_LOAD_U32(apStats + 1692);
+        float apTimer = 0.0f;
+        std::memcpy(&apTimer, &apTimerRaw, sizeof(apTimer));
+
+        if (apCurrentHP != 0 &&
+            apEffect != 0 &&
+            PPC_LOAD_U8(apStats + 1696) == 1 &&
+            std::isfinite(apTimer) && apTimer > 0.0f)
+        {
+            APClient::ConfirmSuperClawsApplied();
+            LOGFN("AP SUPER CLAWS EFFECT CONFIRMED: effect={:08X} time={}",
+                apEffect, apTimer);
+            apClawsWaitingForEffect = false;
+        }
+        else if (++apClawsWaitFrames >= 120 ||
+                 apCurrentHP == 0 ||
+                 apStats != apClawsPreviousStats)
+        {
+            APClient::CancelSuperClaws();
+            LOGFN("AP SUPER CLAWS EFFECT TIMEOUT");
+            apClawsWaitingForEffect = false;
+        }
+    }
+
+    const uint32_t apClawsQueueTimerRaw = PPC_LOAD_U32(apStats + 1692);
+    float apClawsQueueTimer = 0.0f;
+    std::memcpy(&apClawsQueueTimer, &apClawsQueueTimerRaw, sizeof(apClawsQueueTimer));
+
+    const bool apClawsAlreadyActive =
+        PPC_LOAD_U8(apStats + 1696) != 0 ||
+        (std::isfinite(apClawsQueueTimer) && apClawsQueueTimer > 0.0f);
+
+    if (!apClawsWaitingForEffect &&
+        apCurrentHP != 0 &&
+        !apClawsAlreadyActive &&
+        APClient::GetPendingSuperClaws() != 0)
+    {
+        const float apClawsDuration = 30.0f;
+        uint32_t apClawsRaw = 0;
+        std::memcpy(&apClawsRaw, &apClawsDuration, sizeof(apClawsRaw));
+
+        PPC_STORE_U32(apStats + 1692, apClawsRaw);
+        PPC_STORE_U8(apStats + 1696, 1);
+
+        apClawsPreviousStats = apStats;
+        apClawsWaitFrames = 0;
+        apClawsWaitingForEffect = true;
+
+        LOGFN("AP SUPER CLAWS REQUESTED: 30 seconds");
+    }
+    // AP Power Shield : protection de 30 secondes dans les ActN_.
+    static bool apShieldWaitingForEffect = false;
+    static uint32_t apShieldPreviousStats = 0;
+    static unsigned int apShieldWaitFrames = 0;
+
+    if (apShieldWaitingForEffect)
+    {
+        const uint32_t apShieldRaw = PPC_LOAD_U32(apStats + 1700);
+        float apShieldTimer = 0.0f;
+        std::memcpy(&apShieldTimer, &apShieldRaw, sizeof(apShieldTimer));
+
+        if (apCurrentHP != 0 &&
+            apStats == apShieldPreviousStats &&
+            PPC_LOAD_U8(apStats + 1704) == 1 &&
+            std::isfinite(apShieldTimer) &&
+            apShieldTimer > 0.0f)
+        {
+            APClient::ConfirmPowerShieldApplied();
+            LOGFN("AP POWER SHIELD CONFIRMED: time={}", apShieldTimer);
+            apShieldWaitingForEffect = false;
+        }
+        else if (++apShieldWaitFrames >= 120 ||
+                 apCurrentHP == 0 ||
+                 apStats != apShieldPreviousStats)
+        {
+            APClient::CancelPowerShield();
+            LOGFN("AP POWER SHIELD ACTIVATION TIMEOUT");
+            apShieldWaitingForEffect = false;
+        }
+    }
+
+    const uint32_t apShieldQueueTimerRaw = PPC_LOAD_U32(apStats + 1700);
+    float apShieldQueueTimer = 0.0f;
+    std::memcpy(&apShieldQueueTimer, &apShieldQueueTimerRaw, sizeof(apShieldQueueTimer));
+
+    const bool apShieldAlreadyActive =
+        PPC_LOAD_U8(apStats + 1704) != 0 ||
+        (std::isfinite(apShieldQueueTimer) && apShieldQueueTimer > 0.0f);
+
+    if (!apShieldWaitingForEffect &&
+        apCurrentHP != 0 &&
+        !apShieldAlreadyActive &&
+        APClient::GetPendingPowerShield() != 0)
+    {
+        const float apShieldDuration = 30.0f;
+        uint32_t apShieldRaw = 0;
+        std::memcpy(&apShieldRaw, &apShieldDuration, sizeof(apShieldRaw));
+
+        PPC_STORE_U32(apStats + 1700, apShieldRaw);
+        PPC_STORE_U8(apStats + 1704, 1);
+
+        apShieldPreviousStats = apStats;
+        apShieldWaitFrames = 0;
+        apShieldWaitingForEffect = true;
+
+        LOGFN("AP POWER SHIELD REQUESTED: 30 seconds");
+    }
+    // AP Shield Charge : restaurer le bouclier uniquement si necessaire.
+    if (apCurrentHP != 0)
+    {
+        const uint32_t apCurrentShield =
+            PPC_LOAD_U32(apStats + 1664);
+
+        auto apShieldChargeCtx = ctx;
+
+        // Recuperer le bouclier maximum avec la fonction native.
+        ctx.r3.u32 = apStats;
+        sub_823A9E28(ctx, base);
+
+        const uint32_t apMaxShield = ctx.r3.u32;
+        ctx = apShieldChargeCtx;
+
+        if (apMaxShield > 0 &&
+            apCurrentShield < apMaxShield &&
+            APClient::GetPendingShieldCharge() != 0)
+        {
+            ctx.r3.u32 = apStats;
+            ctx.r4.u32 = apMaxShield;
+
+            sub_823AF958(ctx, base);
+
+            const uint32_t apNewShield =
+                PPC_LOAD_U32(apStats + 1664);
+
+            ctx = apShieldChargeCtx;
+
+            if (apNewShield >= apMaxShield)
+            {
+                APClient::ConfirmShieldChargeApplied();
+
+                LOGFN(
+                    "AP SHIELD CHARGE APPLIED: {} -> {} / {}",
+                    apCurrentShield, apNewShield, apMaxShield);
+            }
+            else
+            {
+                APClient::CancelShieldCharge();
+
+                LOGFN(
+                    "AP SHIELD CHARGE WARNING: {} -> {} / {}",
+                    apCurrentShield, apNewShield, apMaxShield);
+            }
+        }
+    }
+    // Ne jamais utiliser le Full Ring sur un Werehog mort.
+    if (apCurrentHP == 0)
+        return;
+
+    // Conserver le contexte du hook original.
+    auto apSavedCtx = ctx;
+
+    // Recuperer les PV maximum avec la fonction du jeu.
+    ctx.r3.u32 = apStats;
+    sub_823A9DE8(ctx, base);
+
+    const uint32_t apMaxHP = ctx.r3.u32;
+
+    ctx = apSavedCtx;
+
+    // Securites : PV maximum valides et sante manquante.
+    if (apMaxHP == 0 || apCurrentHP >= apMaxHP)
+        return;
+
+    // Recuperer un Full Ring Archipelago en attente.
+    if (APClient::GetPendingFullRing() == 0)
+        return;
+
+    // Appliquer le soin via la fonction originale du jeu.
+    ctx.r3.u32 = apStats;
+    ctx.r4.u32 = apMaxHP;
+
+    sub_823AF658(ctx, base);
+
+    const uint32_t apNewHP =
+        PPC_LOAD_U32(apStats + 1660);
+
+    // Restaurer le contexte avant de quitter le hook.
+    ctx = apSavedCtx;
+
+    if (apNewHP >= apMaxHP)
+    {
+        APClient::ConfirmFullRingApplied();
+
+        LOGFN(
+            "AP FULL RING APPLIED: HP {} -> {} / {}",
+            apCurrentHP, apNewHP, apMaxHP);
+    }
+    else
+    {
+        APClient::CancelFullRing();
+
+        LOGFN(
+            "AP FULL RING WARNING: HP {} -> {} / {}",
+            apCurrentHP, apNewHP, apMaxHP);
+    }
+}
+// AP : bonus Rings Archipelago pour le Werehog.
+PPC_FUNC_IMPL(__imp__sub_823AF8E8);
+PPC_FUNC(sub_823AF8E8)
+{
+    const auto apRingObject = ctx.r3.u32;
+    const auto apOriginalRingAmount = ctx.r4.u32;
+
+    // Ajouter les Rings normaux.
+    __imp__sub_823AF8E8(ctx, base);
+
+    // AP Ring Wipe Trap : Werehog.
+    const auto* apWipeDoc = SWA::CGameDocument::GetInstance();
+    const char* apWipeStage =
+        (apWipeDoc && apWipeDoc->m_pMember)
+        ? apWipeDoc->m_pMember->m_StageName.c_str()
+        : "";
+
+    const bool apWipeAllowedStage =
+        std::strncmp(apWipeStage, "ActN_", 5) == 0 ||
+        std::strcmp(apWipeStage, "BossDarkGaiaMoray") == 0 ||
+        std::strcmp(apWipeStage, "BossPhoenix") == 0 ||
+        std::strcmp(apWipeStage, "BossPetra") == 0 ||
+        std::strcmp(apWipeStage, "BossEggDragoon") == 0 ||
+        std::strcmp(apWipeStage, "Act_EggmanLand") == 0;
+
+    if (apRingObject != 0 && apWipeAllowedStage)
+    {
+        const auto apCurrentRings =
+            PPC_LOAD_U32(apRingObject + 1632);
+
+        if (apCurrentRings <= 999999 &&
+            APClient::GetPendingRingWipe() > 0)
+        {
+            if (apCurrentRings > 0)
+            {
+                ctx.r3.u32 = apRingObject;
+                ctx.r4.u32 = 0u - apCurrentRings;
+                __imp__sub_823AF8E8(ctx, base);
+            }
+
+            APClient::ConfirmRingWipeApplied();
+            LOGFN("AP RING WIPE APPLIED: WEREHOG");
+        }
+    }
+
+
+    // Ajouter les Rings Archipelago en attente.
+    const auto apRingBonus = APClient::GetPendingRingBonus();
+
+    if (apRingBonus > 0)
+    {
+        ctx.r3.u32 = apRingObject;
+        ctx.r4.u32 = apRingBonus;
+
+        __imp__sub_823AF8E8(ctx, base);
+
+        APClient::ConfirmRingBonusApplied();
+    }
+}
+// AP DEBUG : observer le gestionnaire de vies sans modifier les vies.
+static thread_local int apLifeSource = 0;
+static bool apInjectedDeath = false;
+static int apInjectedDeathFrames = 0;
+PPC_FUNC_IMPL(__imp__sub_8251A728);
+PPC_FUNC(sub_8251A728)
+{
+    const uint32_t apLifeManager = ctx.r3.u32;
+    const int32_t apLifeDelta = ctx.r4.s32;
+    __imp__sub_8251A728(ctx, base);
+    if (apLifeDelta < 0)
+    {
+        LOGFN("[AP LIFE SOURCE] source={} manager={:08X} delta={}",
+            apLifeSource, apLifeManager, apLifeDelta);
+
+        if (apInjectedDeath && apLifeDelta == -1)
+        {
+            LOGFN("[AP DEATH LINK INJECT] Perte de vie confirmee, protection reinitialisee");
+            apInjectedDeath = false;
+            apInjectedDeathFrames = 0;
+        }
+        else if (apLifeSource == 0 && apLifeDelta == -1 && !apInjectedDeath)
+        {
+            LOGFN("[AP DEATH LINK LOCAL] Natural death candidate");
+            LOGFN("[AP DEATH LINK CALL] Calling QueueDeathLink");
+            APClient::QueueDeathLink();
+            LOGFN("[AP DEATH LINK RETURN] QueueDeathLink finished");
+        }
+    }
+}
+
+// AP DEBUG : observer le gestionnaire de vies lors des lectures.
+PPC_FUNC_IMPL(__imp__sub_8251A5B0);
+PPC_FUNC(sub_8251A5B0)
+{
+    static uint32_t lastManager = 0;
+    const uint32_t manager = ctx.r3.u32;
+    if (manager != lastManager)
+    {
+        LOGFN("AP LIFE READ: manager={:08X}", manager);
+        if (manager != 0)
+        {
+            const uint32_t apData = PPC_LOAD_U32(manager + 152);
+            if (apData != 0)
+            {
+                LOGFN("AP LIFE MODE TEST: flag={} temporaryLives={}",
+                    PPC_LOAD_U8(apData + 32),
+                    PPC_LOAD_U32(apData + 28));
+            }
+        }
+        if (manager != 0) {
+            const uint32_t data = PPC_LOAD_U32(manager + 152);
+            if (data != 0) {
+                const uint32_t flag = PPC_LOAD_U8(data + 32);
+                const uint32_t value = PPC_LOAD_U32(data + 28);
+                LOGFN("AP LIFE VALUES: flag={} value={} data={:08X}", flag, value, data);
+                if (flag == 0) {
+                    const uint32_t saveBase = PPC_LOAD_U32(manager + 148);
+                    if (saveBase != 0) {
+                        const uint32_t lives = PPC_LOAD_U32(saveBase + 32768);
+                        LOGFN("AP LIFE ALTERNATE: lives={} base={:08X}", lives, saveBase);
+
+                        auto* apDoc = SWA::CApplicationDocument::GetInstance();
+                        auto* apParam = (apDoc && apDoc->m_pMember)
+                            ? apDoc->m_pMember->m_spGameParameter.get()
+                            : nullptr;
+                        auto* apSave = apParam ? apParam->m_pSaveData.get() : nullptr;
+
+                        if (apSave)
+                        {
+                            const auto apSaveAddress =
+                                static_cast<uint32_t>(
+                                    reinterpret_cast<uintptr_t>(apSave) -
+                                    reinterpret_cast<uintptr_t>(g_memory.base));
+
+                            LOGFN("AP LIFE ADDRESS TEST: managerBase={:08X} saveData={:08X} match={}",
+                                saveBase, apSaveAddress, saveBase == apSaveAddress);
+                        }
+                    }
+                }
+            }
+        }
+        lastManager = manager;
+    }
+    static unsigned int calls = 0; ++calls; if (calls % 20 == 0) { LOGFN("AP LIFE READ COUNT: appel {}, manager={:08X}", calls, manager); }
+    __imp__sub_8251A5B0(ctx, base);
+    // AP DEBUG : identifier la categorie du stage courant.
+    {
+        static uint32_t apLastStageId = 0xFFFFFFFF;
+        const uint32_t apStageId = ctx.r3.u32;
+
+        if (apStageId != apLastStageId)
+        {
+            const uint32_t apStageCategory = (apStageId % 1000) / 10;
+
+            LOGFN("AP STAGE DEBUG: id={} category={}",
+                apStageId, apStageCategory);
+
+            apLastStageId = apStageId;
+        }
+    }
+
+    // AP Life: appliquer une vie recue d'Archipelago.
+    if (manager != 0)
+    {
+        const uint32_t data = PPC_LOAD_U32(manager + 152);
+        const uint32_t saveBase = PPC_LOAD_U32(manager + 148);
+
+        if (data != 0 && saveBase != 0 &&
+            PPC_LOAD_U8(data + 32) == 0)
+        {
+            const uint32_t lives = PPC_LOAD_U32(saveBase + 32768);
+
+            // Eviter de consommer Life lorsque le compteur est au maximum.
+            if (lives < 99 && APClient::GetPendingLifeBonus() > 0)
+            {
+                auto savedR3 = ctx.r3;
+                auto savedR4 = ctx.r4;
+
+                ctx.r3.u32 = manager;
+                ctx.r4.s32 = 1;
+                __imp__sub_8251A728(ctx, base);
+
+                ctx.r3 = savedR3;
+                ctx.r4 = savedR4;
+
+                LOGFN("AP LIFE APPLIED: Life, lives={}",
+                    PPC_LOAD_U32(saveBase + 32768));
+
+                APClient::ConfirmLifeBonusApplied();
+            }
+        }
+    }
+}
+
+
+
+
+
+// AP DEATH LINK V1 - Sonic Day death diagnostic (H2)
+PPC_FUNC_IMPL(__imp__sub_823176A0);
+PPC_FUNC(sub_823176A0)
+{
+    const uint32_t apSonicContext = ctx.r3.u32;
+    const int32_t apRestart = ctx.r4.s32;
+
+    LOGFN("[AP DEATH H2] Enter: SonicContext={:08X} restart={}",
+        apSonicContext, apRestart);
+
+    __imp__sub_823176A0(ctx, base);
+
+    LOGFN("[AP DEATH H2] Return: SonicContext={:08X} restart={}",
+        apSonicContext, apRestart);
+}
+
+// AP DEATH LINK V1 - H1 state name diagnostic
+PPC_FUNC_IMPL(__imp__sub_82E67958);
+PPC_FUNC(sub_82E67958)
+{
+    static uint32_t apH1Calls = 0;
+    ++apH1Calls;
+
+    const uint32_t apStateObject = ctx.r5.u32;
+
+    if (apStateObject != 0)
+    {
+        PPCContext apNameCtx = ctx;
+        apNameCtx.r3.u64 = apStateObject;
+        sub_82DFAED0(apNameCtx, base);
+
+        const uint32_t apNameAddress = apNameCtx.r3.u32;
+
+        if (apNameAddress >= 0x10000 && apNameAddress < 0x80000000)
+        {
+            const char* apName = reinterpret_cast<const char*>(base + apNameAddress);
+
+            const bool apDeathState =
+                std::strncmp(apName, "NormalDamageDead", 16) == 0 ||
+                std::strncmp(apName, "DrowningDead", 12) == 0 ||
+                std::strncmp(apName, "PressDead", 9) == 0 ||
+                std::strncmp(apName, "Evil_Die", 8) == 0;
+
+            if (apH1Calls <= 50 || apDeathState)
+            {
+                LOGFN("[AP DEATH H1 STATE] Call={} State={:.64}",
+                    apH1Calls, apName);
+            }
+        }
+    }
+
+    __imp__sub_82E67958(ctx, base);
+}
+
+
+// AP DEATH LINK V1 - Life deduction source diagnostic
+PPC_FUNC_IMPL(__imp__sub_8253B7C0);
+PPC_FUNC(sub_8253B7C0)
+{
+    static uint32_t apSourceACalls = 0;
+    ++apSourceACalls;
+
+    if (apSourceACalls <= 3)
+    {
+        LOGFN("[AP DEATH SOURCE A] Call={} r3={:08X}",
+            apSourceACalls, ctx.r3.u32);
+    }
+    const int previousSource = apLifeSource;
+    apLifeSource = 1;
+    __imp__sub_8253B7C0(ctx, base);
+    apLifeSource = previousSource;
+}
+
+PPC_FUNC_IMPL(__imp__sub_8259A0C0);
+PPC_FUNC(sub_8259A0C0)
+{
+    LOGFN("[AP DEATH SOURCE B] Enter r3={:08X}", ctx.r3.u32);
+    const int previousSource = apLifeSource;
+    apLifeSource = 2;
+    __imp__sub_8259A0C0(ctx, base);
+    apLifeSource = previousSource;
+}
+
+PPC_FUNC_IMPL(__imp__sub_82310F20);
+void AP_QteOfDoomOnSonicUpdate(PPCContext& ctx, uint8_t* base);
+void AP_SonicDayFreezeManualOnUpdate(PPCContext& ctx, uint8_t* base);
+// BEGIN AP_FREEZE_TRACE decl
+void AP_FreezeTraceUpdateEnter(PPCContext& ctx, uint8_t* base);
+void AP_FreezeTraceUpdateLeave(PPCContext& ctx, uint8_t* base);
+// END AP_FREEZE_TRACE decl
+PPC_FUNC(sub_82310F20)
+{
+    static bool apLoggedSonicUpdate = false;
+
+    const uint32_t sonicObject = ctx.r3.u32;
+
+    if (!apLoggedSonicUpdate && sonicObject != 0)
+    {
+        LOGFN("[AP SONIC UPDATE] CSonic={:08X} Context={:08X}", sonicObject, PPC_LOAD_U32(sonicObject + 196));
+        apLoggedSonicUpdate = true;
+    }
+
+    if (apInjectedDeath)
+    {
+        ++apInjectedDeathFrames;
+
+        if (apInjectedDeathFrames >= 600)
+        {
+            LOGFN("[AP DEATH LINK WARNING] Injection timeout");
+            apInjectedDeath = false;
+            apInjectedDeathFrames = 0;
+        }
+    }
+
+    if (sonicObject != 0 && !apInjectedDeath)
+    {
+        const uint32_t sonicContext =
+            PPC_LOAD_U32(sonicObject + 196);
+
+        if (sonicContext != 0 &&
+            Config::DeathLinkSonicDay.Value &&
+            APClient::ConsumeIncomingDeathLink())
+        {
+            LOGFN("[AP DEATH LINK INJECT] Sonic Day Context={:08X}",
+                sonicContext);
+
+            apInjectedDeath = true;
+            apInjectedDeathFrames = 0;
+
+            PPCContext deathCtx = ctx;
+            deathCtx.r3.u32 = sonicContext;
+            deathCtx.r4.u32 = 1;
+
+            sub_823176A0(deathCtx, base);
+
+            LOGFN("[AP DEATH LINK INJECT] Appel termine");
+        }
+    }
+
+    // AP_SONIC_DAY_FREEZE_MANUAL_V1
+    AP_SonicDayFreezeManualOnUpdate(ctx, base);    AP_QteOfDoomOnSonicUpdate(ctx, base);
+    // BEGIN AP_FREEZE_TRACE upd-enter
+    AP_FreezeTraceUpdateEnter(ctx, base);
+    // END AP_FREEZE_TRACE upd-enter
+    __imp__sub_82310F20(ctx, base);
+    // BEGIN AP_FREEZE_TRACE upd-leave
+    AP_FreezeTraceUpdateLeave(ctx, base);
+    // END AP_FREEZE_TRACE upd-leave
+}
+
+// AP WEREHOG DEATH LINK - DIAGNOSTIC
+// Verifie les appels de la fonction qui surveille les HP.
+// Aucun Death Link consomme et aucune modification des HP.
+
+PPC_FUNC_IMPL(__imp__sub_823B0168);
+PPC_FUNC(sub_823B0168)
+{
+    static unsigned int apWerehogDeathCalls = 0;
+
+    const uint32_t apStats = ctx.r3.u32;
+
+    if (apStats != 0 && ++apWerehogDeathCalls % 600 == 0)
+    {
+        const uint32_t apHP = PPC_LOAD_U32(apStats + 1660);
+
+        LOGFN("[AP WEREHOG DEATH HOOK] Calls={} Stats={:08X} HP={}",
+            apWerehogDeathCalls, apStats, apHP);
+    }
+
+    // DEATH LINK ENTRANT - WEREHOG
+    // Seulement pendant un niveau Werehog actif.
+
+    const auto* apTestDoc = SWA::CGameDocument::GetInstance();
+
+    const char* apTestStage =
+        (apTestDoc && apTestDoc->m_pMember)
+        ? apTestDoc->m_pMember->m_StageName.c_str()
+        : nullptr;
+
+    const bool apValidWerehogStage =
+        apTestStage != nullptr &&
+        (
+            std::strncmp(apTestStage, "ActN_", 5) == 0 ||
+            std::strcmp(apTestStage, "BossDarkGaiaMoray") == 0 ||
+            std::strcmp(apTestStage, "BossPhoenix") == 0 ||
+            std::strcmp(apTestStage, "BossPetra") == 0 ||
+            std::strcmp(apTestStage, "BossEggDragoon") == 0 ||
+            std::strcmp(apTestStage, "Act_EggmanLand") == 0
+        );
+
+    if (apStats != 0 &&
+        apValidWerehogStage &&
+        !apInjectedDeath)
+    {
+        const uint32_t apHPBefore =
+            PPC_LOAD_U32(apStats + 1660);
+
+        if (apHPBefore > 0 &&
+            Config::DeathLinkWerehog.Value &&
+            APClient::ConsumeIncomingDeathLink())
+        {
+            apInjectedDeath = true;
+            apInjectedDeathFrames = 0;
+
+            PPC_STORE_U32(apStats + 1660, 0);
+
+            LOGFN("[AP DEATH LINK WEREHOG] Incoming Death Link! Stats={:08X} HP={} -> 0",
+                apStats, apHPBefore);
+        }
+    }
+        // BEGIN AP_WEREHOG_BURN_DAMAGE_TICK_V1
+    if (apBurnDamageActive)
+    {
+        const auto now = std::chrono::steady_clock::now();
+
+        const auto* burnDoc = SWA::CGameDocument::GetInstance();
+        const char* burnStage =
+            (burnDoc && burnDoc->m_pMember)
+            ? burnDoc->m_pMember->m_StageName.c_str()
+            : nullptr;
+
+        const bool burnInvalid =
+            apStats != apBurnDamageStats ||
+            burnStage == nullptr ||
+            apBurnDamageStage != burnStage ||
+            now - apBurnDamageLastCall > std::chrono::seconds(1);
+
+        if (burnInvalid)
+        {
+            apBurnDamageActive = false;
+            LOGFN("[AP BURN DAMAGE] Cancelled");
+        }
+        else
+        {
+            apBurnDamageLastCall = now;
+
+            const uint32_t hp =
+                PPC_LOAD_U32(apStats + 1660);
+
+            if (hp == 0)
+            {
+                apBurnDamageActive = false;
+            }
+            else
+            {
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - apBurnDamageStart).count();
+
+                const unsigned int dueTicks =
+                    static_cast<unsigned int>(
+                        std::min<int64_t>(3, elapsed / 1000));
+
+                if (apBurnDamageTicks < dueTicks)
+                {
+                    const uint32_t newHP =
+                        hp > 100 ? hp - 100 : 0;
+
+                    PPC_STORE_U32(apStats + 1660, newHP);
+                    ++apBurnDamageTicks;
+
+                    LOGFN("[AP BURN DAMAGE] Tick={} HP {} -> {}",
+                        apBurnDamageTicks, hp, newHP);
+                }
+
+                if (apBurnDamageTicks >= 3)
+                {
+                    apBurnDamageActive = false;
+                    LOGFN("[AP BURN DAMAGE] Completed");
+                }
+            }
+        }
+    }
+    // END AP_WEREHOG_BURN_DAMAGE_TICK_V1
+    __imp__sub_823B0168(ctx, base);
+}
+
+
+
+
+
+
+

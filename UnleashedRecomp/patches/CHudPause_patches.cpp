@@ -5,6 +5,8 @@
 #include <ui/options_menu.h>
 #include <locale/locale.h>
 #include <app.h>
+#include <os/logger.h>
+#include "../archipelago_client.h"
 
 bool g_isClosed;
 
@@ -119,6 +121,46 @@ bool CHudPauseMiscInjectOptionsMidAsmHook(PPCRegister& pThis)
 PPC_FUNC_IMPL(__imp__sub_824B0930);
 PPC_FUNC(sub_824B0930)
 {
+    // AP XP : diagnostic du menu pause.
+    static int apPreviousPauseState = -1;
+    const uint32_t apPauseObject = ctx.r3.u32;
+    const int apPauseOpen = PPC_LOAD_U8(apPauseObject + 389);
+
+    // AP Crystal XP : deuxieme declencheur via le menu pause.
+    if (apPauseOpen == 1 && !App::s_isLoading)
+    {
+        auto* appDoc = SWA::CApplicationDocument::GetInstance();
+        auto* param = (appDoc && appDoc->m_pMember)
+            ? appDoc->m_pMember->m_spGameParameter.get()
+            : nullptr;
+        auto* save = param ? param->m_pSaveData.get() : nullptr;
+
+        if (save)
+        {
+            const std::uint32_t crystalXP =
+                APClient::GetPendingCrystalXPBonus();
+
+            if (crystalXP == 50u ||
+                crystalXP == 100u ||
+                crystalXP == 200u)
+            {
+                LOGFN("AP CRYSTAL XP PAUSE: applying +{} XP", crystalXP);
+
+                GuestToHostFunction<void>(
+                    sub_823A8760, 0u, crystalXP
+                );
+
+                APClient::ConfirmCrystalXPBonusApplied();
+
+                LOGFN("AP CRYSTAL XP PAUSE: native call completed");
+            }
+        }
+    }
+    if (apPreviousPauseState != apPauseOpen)
+    {
+        LOGFN("AP XP PAUSE: open={}", apPauseOpen);
+        apPreviousPauseState = apPauseOpen;
+    }
     if (App::s_isLoading)
     {
         __imp__sub_824B0930(ctx, base);

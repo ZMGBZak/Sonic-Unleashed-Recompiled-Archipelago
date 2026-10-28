@@ -1,4 +1,25 @@
+#include <nfd.h>
+#include <SDL.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <cstdio>
+#include <vector>
+#include <apu/custom_music.h>
 #include "video.h"
+// AP_UPDATER_V1_INCLUDES
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <stdexcept>
+#include <nlohmann/json.hpp>
+#ifdef _WIN32
+#include <Windows.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+#endif
 
 #include "imgui/imgui_common.h"
 #include "imgui/imgui_snapshot.h"
@@ -29,9 +50,14 @@
 #include <ui/black_bar.h>
 #include <patches/aspect_ratio_patches.h>
 #include <user/config.h>
+#include <cstdlib>
+#include <fstream>
+#include "../archipelago_client.h"
+namespace APClient { int GetMedalGoalCount(); }
 #include <sdl_listener.h>
 #include <xxHashMap.h>
 #include <os/process.h>
+#include <os/logger.h>
 
 #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
 #include <magic_enum/magic_enum.hpp>
@@ -1361,6 +1387,179 @@ struct ImGuiPushConstants
 
 extern ImFontBuilderIO g_fontBuilderIO;
 
+// AP_UPDATER_V1_BEGIN - HTTPS version checker only (no file downloads).
+#ifdef _WIN32
+namespace APUpdateV1
+{
+    constexpr const char* kClientVersion = "0.0.0";
+    constexpr const char* kAPWorldVersion = "0.0.0";
+    constexpr const char* kReleasePage = "https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases";
+    static std::atomic<int> status{0}; // 0 idle, 1 checking, 2 complete, 3 error
+    static std::mutex resultMutex;
+    static std::string latestClient;
+    static std::string latestAPWorld;
+    static std::string message;
+
+    // Read only our fixed update manifest. No remote-supplied download paths or filenames.
+    static bool ReadManifest(std::string& out, std::string& error)
+    {
+        HINTERNET session = WinHttpOpen(L"SonicUnleashedArchipelagoUpdater/0.0.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session) { error = "Cannot initialize HTTPS."; return false; }
+        WinHttpSetTimeouts(session, 5000, 5000, 8000, 8000);
+        HINTERNET connection = WinHttpConnect(session, L"raw.githubusercontent.com",
+            INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!connection) { WinHttpCloseHandle(session); error = "Cannot connect to GitHub."; return false; }
+        HINTERNET request = WinHttpOpenRequest(connection, L"GET",
+            L"/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/main/updates/manifest.json",
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        bool ok = request && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr);
+        DWORD httpCode = 0, codeSize = sizeof(httpCode);
+        if (ok) ok = !!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &httpCode, &codeSize, WINHTTP_NO_HEADER_INDEX);
+        if (!ok || httpCode != 200)
+        {
+            error = httpCode == 404 ? "No public update manifest yet (repository is private?)."
+                : "Could not fetch GitHub update manifest.";
+            ok = false;
+        }
+        while (ok)
+        {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request, &available)) { ok = false; break; }
+            if (!available) break;
+            if (available > 65536 || out.size() + available > 65536) { ok = false; break; }
+            char buffer[4096];
+            while (available && ok)
+            {
+                DWORD read = 0;
+                const DWORD amount = (std::min)(available, DWORD(sizeof(buffer)));
+                if (!WinHttpReadData(request, buffer, amount, &read) || read == 0) { ok = false; break; }
+                out.append(buffer, read);
+                available -= read;
+            }
+        }
+        if (request) WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        if (!ok && error.empty()) error = "GitHub download interrupted.";
+        return ok;
+    }
+
+    static void StartCheck()
+    {
+        if (status.exchange(1) == 1) return;
+        std::thread([]()
+        {
+            std::string body, error, client, apworld;
+            bool ok = ReadManifest(body, error);
+            if (ok)
+            {
+                try
+                {
+                    auto j = nlohmann::json::parse(body);
+                    client = j.at("client_version").get<std::string>();
+                    apworld = j.at("apworld_version").get<std::string>();
+                    if (client.empty() || apworld.empty() || client.size() > 32 || apworld.size() > 32)
+                        throw std::runtime_error("invalid versions");
+                }
+                catch (...) { ok = false; error = "Invalid update manifest."; }
+            }
+            {
+                std::lock_guard<std::mutex> lock(resultMutex);
+                latestClient = client;
+                latestAPWorld = apworld;
+                message = error;
+            }
+            status.store(ok ? 2 : 3);
+        }).detach();
+    }
+
+    // AP_UPDATER_VERSION_UI_V2: parse strict major.minor.patch, reject malformed version strings.
+    static bool ParseVersion(const std::string& text, unsigned int (&parts)[3])
+    {
+        if (text.empty() || text.size() > 32) return false;
+        unsigned int a = 0, b = 0, c = 0;
+        char trailing = '\0';
+        if (std::sscanf(text.c_str(), "%u.%u.%u%c", &a, &b, &c, &trailing) != 3) return false;
+        parts[0] = a; parts[1] = b; parts[2] = c;
+        return true;
+    }
+    static bool IsNewerVersion(const std::string& incoming, const std::string& current)
+    {
+        unsigned int n[3] = {}, c[3] = {};
+        if (!ParseVersion(incoming, n) || !ParseVersion(current, c)) return false;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (n[i] > c[i]) return true;
+            if (n[i] < c[i]) return false;
+        }
+        return false;
+    }
+    static void DrawControls()
+    {
+        ImGui::BeginDisabled(status.load() == 1);
+        if (ImGui::Button("CHECK FOR UPDATES", ImVec2(-1, 40))) StartCheck();
+        // AP_F8_USABILITY_V4: chrome / glossy look matching other menu buttons.
+        {
+            const ImVec2 p = ImGui::GetItemRectMin();
+            const ImVec2 s = ImGui::GetItemRectSize();
+            const ImVec2 bottom(p.x + s.x, p.y + s.y);
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            draw->AddRectFilled(
+                ImVec2(p.x + 5.0f, p.y + 4.0f),
+                ImVec2(bottom.x - 5.0f, p.y + s.y * 0.38f),
+                IM_COL32(180, 225, 255, 55), 10.0f);
+            draw->AddRect(
+                ImVec2(p.x + 1.0f, p.y + 1.0f),
+                ImVec2(bottom.x - 1.0f, bottom.y - 1.0f),
+                IM_COL32(160, 215, 245, 235), 13.0f, 0, 2.5f);
+            draw->AddRect(
+                ImVec2(p.x + 4.0f, p.y + 4.0f),
+                ImVec2(bottom.x - 4.0f, bottom.y - 4.0f),
+                IM_COL32(15, 55, 105, 210), 10.0f, 0, 1.5f);
+            draw->AddLine(
+                ImVec2(p.x + 17.0f, p.y + 2.0f),
+                ImVec2(bottom.x - 17.0f, p.y + 2.0f),
+                IM_COL32(225, 245, 255, 170), 1.5f);
+        }
+        ImGui::EndDisabled();
+        const int state = status.load();
+        if (state == 1) ImGui::TextUnformatted("Checking GitHub...");
+        if (state == 2)
+        {
+            std::lock_guard<std::mutex> lock(resultMutex);
+            // AP_UPDATER_VERSION_UI_V2: only newer semver versions trigger update actions.
+            const bool clientNew = IsNewerVersion(latestClient, kClientVersion);
+            const bool worldNew = IsNewerVersion(latestAPWorld, kAPWorldVersion);
+            ImGui::Text("Client: %s  /  latest: %s", kClientVersion, latestClient.c_str());
+            ImGui::Text("APWorld: %s  /  latest: %s", kAPWorldVersion, latestAPWorld.c_str());
+            if (!clientNew && !worldNew)
+                ImGui::TextUnformatted("You're up to date!");
+            if (clientNew)
+            {
+                ImGui::TextWrapped("New client version available on GitHub.");
+                if (ImGui::Button("VIEW CLIENT UPDATE", ImVec2(-1, 38)))
+                    SDL_OpenURL(kReleasePage);
+            }
+            if (worldNew)
+            {
+                ImGui::TextWrapped("New APWorld available. Download it manually from GitHub.");
+                if (ImGui::Button("VIEW APWORLD DOWNLOAD", ImVec2(-1, 38)))
+                    SDL_OpenURL(kReleasePage);
+            }
+        }
+        if (state == 3)
+        {
+            std::lock_guard<std::mutex> lock(resultMutex);
+            ImGui::TextWrapped("Update check: %s", message.c_str());
+        }
+    }
+}
+#endif
+// AP_UPDATER_V1_END
 static void CreateImGuiBackend()
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -1374,6 +1573,7 @@ static void CreateImGuiBackend()
 #else
     io.Fonts->AddFontDefault();
     ImFontAtlasSnapshot::GenerateGlyphRanges();
+
 #endif
 
     InitImGuiUtils();
@@ -2499,6 +2699,71 @@ static void DrawProfiler()
     font->Scale = defaultScale;
 }
 
+
+// AP_MEDALS_HUD_V1: 141-frame looping Blender animation at 60 FPS.
+static std::unique_ptr<GuestTexture> g_apMedalsAtlas;
+static bool g_apMedalsAtlasAttempted = false;
+static void DrawAPMedalsHud()
+{
+    const int medalCount = APClient::GetMedalGoalCount();
+    if (medalCount < 0) return;
+    if (!g_apMedalsAtlasAttempted)
+    {
+        g_apMedalsAtlasAttempted = true;
+        std::ifstream file("ap_medals_atlas.dds", std::ios::binary | std::ios::ate);
+        if (file)
+        {
+            const auto size = file.tellg();
+            if (size > 0 && size < 40000000)
+            {
+                std::vector<uint8_t> bytes(static_cast<size_t>(size));
+                file.seekg(0);
+                if (file.read(reinterpret_cast<char*>(bytes.data()), bytes.size()))
+                    g_apMedalsAtlas = LoadTexture(bytes.data(), bytes.size());
+            }
+        }
+        if (!g_apMedalsAtlas) std::printf("AP MEDALS HUD: ap_medals_atlas.dds missing or invalid\n");
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float scale = std::clamp(display.y / 1080.0f, 0.65f, 1.6f);
+    const float iconSize = 104.0f * scale;
+    const float x = 22.0f * scale;
+    const float y = display.y - iconSize - 20.0f * scale;
+    auto* draw = ImGui::GetForegroundDrawList();
+    if (g_apMedalsAtlas)
+    {
+        const int frame = static_cast<int>(std::floor(ImGui::GetTime() * 60.0)) % 141;
+        const int col = frame % 12, row = frame / 12;
+        const ImVec2 uv0(col / 12.0f, row / 12.0f);
+        const ImVec2 uv1((col + 1) / 12.0f, (row + 1) / 12.0f);
+        draw->AddImage(g_apMedalsAtlas.get(), ImVec2(x,y), ImVec2(x+iconSize,y+iconSize), uv0, uv1);
+    }
+    // AP_MEDALS_TEXT_V3: floating metallic silver text, no background.
+    const std::string medalText = fmt::format("{} / 370", medalCount);
+    ImFont* medalFont = ImGui::GetFont();
+    const float medalFontSize = 33.0f * scale;
+    const ImVec2 medalPos(x + iconSize + 12.0f * scale, y + 27.0f * scale);
+    const ImVec2 medalExtent = medalFont->CalcTextSizeA(medalFontSize, FLT_MAX, 0.0f, medalText.c_str());
+    const ImU32 silverTop = medalCount >= 370 ? IM_COL32(255, 242, 174, 255) : IM_COL32(250, 253, 255, 255);
+    const ImU32 silverBottom = medalCount >= 370 ? IM_COL32(219, 154, 39, 255) : IM_COL32(133, 164, 193, 255);
+    // A small dark outline improves legibility without a panel.
+    const float outline = 1.4f * scale;
+    draw->AddText(medalFont, medalFontSize, ImVec2(medalPos.x - outline, medalPos.y), IM_COL32(6, 13, 24, 240), medalText.c_str());
+    draw->AddText(medalFont, medalFontSize, ImVec2(medalPos.x + outline, medalPos.y), IM_COL32(6, 13, 24, 240), medalText.c_str());
+    draw->AddText(medalFont, medalFontSize, ImVec2(medalPos.x, medalPos.y - outline), IM_COL32(6, 13, 24, 240), medalText.c_str());
+    draw->AddText(medalFont, medalFontSize, ImVec2(medalPos.x, medalPos.y + outline), IM_COL32(6, 13, 24, 240), medalText.c_str());
+    const float splitY = medalPos.y + medalExtent.y * 0.48f;
+    draw->PushClipRect(ImVec2(medalPos.x - 2.0f, medalPos.y - 2.0f),
+                       ImVec2(medalPos.x + medalExtent.x + 3.0f, splitY), true);
+    draw->AddText(medalFont, medalFontSize, medalPos, silverTop, medalText.c_str());
+    draw->PopClipRect();
+    draw->PushClipRect(ImVec2(medalPos.x - 2.0f, splitY),
+                       ImVec2(medalPos.x + medalExtent.x + 3.0f, medalPos.y + medalExtent.y + 3.0f), true);
+    draw->AddText(medalFont, medalFontSize, medalPos, silverBottom, medalText.c_str());
+    draw->PopClipRect();
+}
+
 static void DrawFPS()
 {
     if (!Config::ShowFPS)
@@ -2591,6 +2856,1783 @@ static void DrawImGui()
     ImGui::End();
 #endif
 
+    // AP Connector : menu Archipelago integre.
+    extern bool g_apConnectorVisible;
+
+    // AP Sliding Menu Animation
+    static float apSlideProgress = 0.0f;
+
+    const float apSlideDelta =
+        ImGui::GetIO().DeltaTime * 3.0f;
+
+    if (g_apConnectorVisible)
+    {
+        apSlideProgress += apSlideDelta;
+        if (apSlideProgress > 1.0f)
+            apSlideProgress = 1.0f;
+    }
+    else
+    {
+        apSlideProgress -= apSlideDelta;
+        if (apSlideProgress < 0.0f)
+            apSlideProgress = 0.0f;
+    }
+
+    const float apSmooth =
+        apSlideProgress * apSlideProgress *
+        (3.0f - 2.0f * apSlideProgress);
+
+    // AP Attached Sliding F8 Handle
+    {
+        const ImGuiViewport* apViewport = ImGui::GetMainViewport();
+
+        // La poignee suit exactement la position du panneau.
+        // Poignee attachee au coin superieur droit du panneau.
+        // Ferme : F8 reste visible au bord gauche de l'ecran.
+        // Ouvert : F8 accompagne le panneau vers la droite.
+        const float apPanelX =
+            -600.0f + 660.0f * apSmooth;
+
+        const float apHandleX =
+            apViewport->Pos.x + apPanelX + 600.0f;
+
+        const float apHandleY =
+            apViewport->Pos.y + 70.0f;
+
+        ImGui::SetNextWindowPos(
+            ImVec2(apHandleX, apHandleY),
+            ImGuiCond_Always
+        );
+
+        ImGui::SetNextWindowSize(
+            ImVec2(64.0f, 76.0f),
+            ImGuiCond_Always
+        );
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 5.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 7.0f);
+
+        ImGui::PushStyleColor(
+            ImGuiCol_WindowBg,
+            ImVec4(0.025f, 0.08f, 0.18f, 0.97f)
+        );
+
+        ImGui::PushStyleColor(
+            ImGuiCol_Border,
+            ImVec4(0.25f, 0.70f, 1.0f, 1.0f)
+        );
+
+        ImGui::PushStyleColor(
+            ImGuiCol_Button,
+            ImVec4(0.08f, 0.30f, 0.57f, 1.0f)
+        );
+
+        ImGui::PushStyleColor(
+            ImGuiCol_ButtonHovered,
+            ImVec4(0.17f, 0.52f, 0.85f, 1.0f)
+        );
+
+        ImGui::Begin(
+            "##APF8Tab",
+            nullptr,
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoCollapse
+        );
+
+        ImFont* apTabFont =
+            ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
+
+        ImGui::PushFont(apTabFont);
+        ImGui::SetWindowFontScale(1.35f);
+
+        if (ImGui::Button("F8", ImVec2(52.0f, 64.0f)))
+        {
+            g_apConnectorVisible = !g_apConnectorVisible;
+        }
+
+        ImGui::PopFont();
+
+        // Reflets metalliques de la poignee.
+        {
+            ImVec2 p = ImGui::GetItemRectMin();
+            ImVec2 s = ImGui::GetItemRectSize();
+
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+
+            draw->AddRect(
+                p,
+                ImVec2(p.x + s.x, p.y + s.y),
+                IM_COL32(145, 220, 255, 230),
+                7.0f, 0, 2.0f
+            );
+
+            draw->AddLine(
+                ImVec2(p.x + 9.0f, p.y + 3.0f),
+                ImVec2(p.x + s.x - 9.0f, p.y + 3.0f),
+                IM_COL32(225, 245, 255, 180),
+                2.0f
+            );
+        }
+
+        ImGui::End();
+
+        ImGui::PopStyleColor(4);
+        ImGui::PopStyleVar(4);
+    }
+    if (apSlideProgress > 0.0f)
+    {
+        SDL_ShowCursor(SDL_ENABLE);
+        // Archipelago Connector - Midnight Blue Metal Theme.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 16.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 14.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, 12.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 9.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 9.0f));
+
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.035f, 0.065f, 0.13f, 0.97f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.48f, 0.75f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.055f, 0.12f, 0.24f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.09f, 0.23f, 0.43f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.36f, 0.67f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.58f, 0.94f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.07f, 0.28f, 0.55f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.07f, 0.15f, 0.27f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.11f, 0.23f, 0.40f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.14f, 0.30f, 0.50f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.95f, 1.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.22f, 0.49f, 0.74f, 0.75f));
+
+                // AP Sliding Window Position
+        const float apMenuWidth = 600.0f;
+        const float apHiddenX = -apMenuWidth;
+        const float apVisibleX = 60.0f;
+
+        const float apMenuX =
+            apHiddenX +
+            (apVisibleX - apHiddenX) * apSmooth;
+
+        ImGui::SetNextWindowPos(
+            ImVec2(apMenuX, 50.0f),
+            ImGuiCond_Always
+        );
+
+        ImGui::SetNextWindowSize(
+            ImVec2(600.0f, 900.0f),
+            ImGuiCond_Always
+        );
+
+        if (ImGui::Begin(
+            "Sonic Unleashed - Archipelago Connector",
+            &g_apConnectorVisible,
+            ImGuiWindowFlags_NoCollapse))
+        {
+            // AP Midnight Metal Background
+            {
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                ImVec2 p = ImGui::GetWindowPos();
+                ImVec2 s = ImGui::GetWindowSize();
+
+                const float x = p.x;
+                const float y = p.y;
+                const float w = s.x;
+                const float h = s.y;
+
+                // Texture metallique : fines lignes horizontales.
+                for (float i = 48.0f; i < h - 12.0f; i += 7.0f)
+                {
+                    draw->AddLine(
+                        ImVec2(x + 12.0f, y + i),
+                        ImVec2(x + w - 12.0f, y + i),
+                        IM_COL32(55, 125, 195, 17),
+                        1.0f
+                    );
+                }
+
+                // Encadrement interieur lumineux.
+                draw->AddRect(
+                    ImVec2(x + 6.0f, y + 30.0f),
+                    ImVec2(x + w - 6.0f, y + h - 6.0f),
+                    IM_COL32(35, 150, 245, 135),
+                    12.0f, 0, 1.5f
+                );
+
+                // Trois griffures diagonales inspirees du Werehog.
+                for (int i = 0; i < 3; ++i)
+                {
+                    float offset = static_cast<float>(i) * 29.0f;
+
+                    ImVec2 a(
+                        x + w - 105.0f + offset,
+                        y + h * 0.61f
+                    );
+
+                    ImVec2 b(
+                        x + w - 205.0f + offset,
+                        y + h - 32.0f
+                    );
+
+                    // Halo bleu autour de chaque griffure.
+                    draw->AddLine(
+                        a, b,
+                        IM_COL32(0, 110, 255, 38),
+                        10.0f
+                    );
+
+                    // Trait principal.
+                    draw->AddLine(
+                        a, b,
+                        IM_COL32(25, 145, 255, 115),
+                        3.0f
+                    );
+
+                    // Reflet central.
+                    draw->AddLine(
+                        a, b,
+                        IM_COL32(145, 225, 255, 145),
+                        1.0f
+                    );
+                }
+
+                // Accents lumineux dans les coins.
+                draw->AddLine(
+                    ImVec2(x + 22.0f, y + 34.0f),
+                    ImVec2(x + 110.0f, y + 34.0f),
+                    IM_COL32(60, 205, 255, 185),
+                    2.0f
+                );
+
+                draw->AddLine(
+                    ImVec2(x + w - 110.0f, y + h - 12.0f),
+                    ImVec2(x + w - 22.0f, y + h - 12.0f),
+                    IM_COL32(60, 205, 255, 185),
+                    2.0f
+                );
+            }
+
+            // Texte plus grand pour le menu Archipelago.
+            ImFont* apBubbleFont =
+                ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
+
+            ImGui::PushFont(apBubbleFont);
+            ImGui::SetWindowFontScale(0.85f);
+
+            // AP Metallic Header
+            {
+                ImVec2 headerPos = ImGui::GetCursorScreenPos();
+                float headerWidth = ImGui::GetContentRegionAvail().x;
+                float headerHeight = 100.0f;
+
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                ImVec2 headerEnd(
+                    headerPos.x + headerWidth,
+                    headerPos.y + headerHeight
+                );
+
+                // Fond metallique en degrade bleu nuit.
+                draw->AddRectFilledMultiColor(
+                    headerPos,
+                    headerEnd,
+                    IM_COL32(19, 66, 116, 255),
+                    IM_COL32(5, 24, 56, 255),
+                    IM_COL32(3, 13, 35, 255),
+                    IM_COL32(10, 38, 77, 255)
+                );
+
+                // Encadrement chrome.
+                draw->AddRect(
+                    headerPos,
+                    headerEnd,
+                    IM_COL32(125, 195, 240, 230),
+                    8.0f, 0, 2.0f
+                );
+
+                // Ligne lumineuse superieure.
+                draw->AddLine(
+                    ImVec2(headerPos.x + 15.0f, headerPos.y + 3.0f),
+                    ImVec2(headerEnd.x - 15.0f, headerPos.y + 3.0f),
+                    IM_COL32(180, 235, 255, 190),
+                    2.0f
+                );
+
+                // Petit embleme technologique.
+                ImVec2 emblem(
+                    headerPos.x + 35.0f,
+                    headerPos.y + 42.0f
+                );
+
+                draw->AddCircleFilled(
+                    emblem,
+                    24.0f,
+                    IM_COL32(5, 24, 53, 255),
+                    32
+                );
+
+                draw->AddCircle(
+                    emblem,
+                    23.0f,
+                    IM_COL32(80, 190, 255, 230),
+                    32, 2.5f
+                );
+
+                draw->AddCircle(
+                    emblem,
+                    16.0f,
+                    IM_COL32(160, 225, 255, 190),
+                    32, 1.5f
+                );
+
+                // Lignes du globe Archipelago.
+                draw->AddLine(
+                    ImVec2(emblem.x - 16.0f, emblem.y),
+                    ImVec2(emblem.x + 16.0f, emblem.y),
+                    IM_COL32(110, 215, 255, 220),
+                    1.5f
+                );
+
+                draw->AddLine(
+                    ImVec2(emblem.x, emblem.y - 16.0f),
+                    ImVec2(emblem.x, emblem.y + 16.0f),
+                    IM_COL32(110, 215, 255, 220),
+                    1.5f
+                );
+
+                // Titres du panneau.
+                draw->AddText(
+                    ImVec2(headerPos.x + 72.0f, headerPos.y + 17.0f),
+                    IM_COL32(155, 210, 255, 255),
+                    "SONIC UNLEASHED"
+                );
+
+                draw->AddText(
+                    ImVec2(headerPos.x + 72.0f, headerPos.y + 43.0f),
+                    IM_COL32(240, 248, 255, 255),
+                    "ARCHIPELAGO CONNECTOR"
+                );
+
+                // Credits du createur, toujours visibles dans l'en-tete F8.
+                draw->AddText(
+                    ImVec2(headerPos.x + 74.0f, headerPos.y + 62.0f),
+                    IM_COL32(155, 225, 255, 255),
+                    "Created by ZMGB_Zak"
+                );
+
+                // Barre lumineuse sous le titre.
+                draw->AddLine(
+                    ImVec2(headerPos.x + 73.0f, headerPos.y + 87.0f),
+                    ImVec2(headerEnd.x - 18.0f, headerPos.y + 87.0f),
+                    IM_COL32(40, 175, 255, 170),
+                    2.0f
+                );
+
+                // Reserver l'espace pour les autres controles.
+                ImGui::Dummy(ImVec2(0.0f, headerHeight));
+            }
+            // AP_F8_REORDER_V1: update checker near connector title.
+#ifdef _WIN32
+            APUpdateV1::DrawControls();
+#endif
+            ImGui::Separator();
+
+            ImGui::Spacing();
+            // AP Animated Connection Status
+            ImGui::TextColored(
+                ImVec4(0.40f, 0.82f, 1.0f, 1.0f),
+                "STATUS"
+            );
+
+            const auto apState = APClient::GetConnectionState();
+
+            const char* apStatusText = "Disconnected";
+            ImVec4 apStatusColor(1.0f, 0.25f, 0.25f, 1.0f);
+
+            switch (apState)
+            {
+            case APClient::ConnectionState::Connected:
+                apStatusText = "Connected";
+                apStatusColor = ImVec4(0.10f, 1.0f, 0.25f, 1.0f);
+                break;
+
+            case APClient::ConnectionState::Connecting:
+                apStatusText = "Connecting...";
+                apStatusColor = ImVec4(1.0f, 0.70f, 0.10f, 1.0f);
+                break;
+
+            case APClient::ConnectionState::Disconnecting:
+                apStatusText = "Disconnecting...";
+                apStatusColor = ImVec4(1.0f, 0.55f, 0.10f, 1.0f);
+                break;
+
+            default:
+                break;
+            }
+
+            // Animation douce : cycle d'environ 2.8 secondes.
+            const float apPulse =
+                0.5f + 0.5f * sinf(
+                    static_cast<float>(ImGui::GetTime()) * 2.25f
+                );
+
+            ImGui::BeginChild(
+                "##APStatusPanel",
+                ImVec2(0.0f, 65.0f),
+                true,
+                ImGuiWindowFlags_NoScrollbar
+            );
+
+            ImDrawList* apStatusDraw = ImGui::GetWindowDrawList();
+            ImVec2 apPanelPos = ImGui::GetWindowPos();
+
+            // AP Neon Status Frame
+            ImVec2 apPanelSize = ImGui::GetWindowSize();
+
+            apStatusDraw->AddRectFilled(
+                ImVec2(apPanelPos.x + 2.0f, apPanelPos.y + 2.0f),
+                ImVec2(
+                    apPanelPos.x + apPanelSize.x - 2.0f,
+                    apPanelPos.y + apPanelSize.y - 2.0f
+                ),
+                IM_COL32(3, 17, 39, 215),
+                9.0f
+            );
+
+            // Halo bleu discret.
+            apStatusDraw->AddRect(
+                ImVec2(apPanelPos.x + 3.0f, apPanelPos.y + 3.0f),
+                ImVec2(
+                    apPanelPos.x + apPanelSize.x - 3.0f,
+                    apPanelPos.y + apPanelSize.y - 3.0f
+                ),
+                IM_COL32(0, 125, 255, 65),
+                9.0f, 0, 4.0f
+            );
+
+            // Contour cyan metallique.
+            apStatusDraw->AddRect(
+                ImVec2(apPanelPos.x + 3.0f, apPanelPos.y + 3.0f),
+                ImVec2(
+                    apPanelPos.x + apPanelSize.x - 3.0f,
+                    apPanelPos.y + apPanelSize.y - 3.0f
+                ),
+                IM_COL32(65, 185, 255, 210),
+                9.0f, 0, 1.5f
+            );
+
+            // Reflet sur le bord superieur.
+            apStatusDraw->AddLine(
+                ImVec2(apPanelPos.x + 20.0f, apPanelPos.y + 4.0f),
+                ImVec2(
+                    apPanelPos.x + apPanelSize.x - 20.0f,
+                    apPanelPos.y + 4.0f
+                ),
+                IM_COL32(145, 225, 255, 100),
+                1.0f
+            );
+
+            ImVec2 apLedCenter(
+                apPanelPos.x + 30.0f,
+                apPanelPos.y + 32.0f
+            );
+
+            // Halo lumineux pulsant.
+            apStatusDraw->AddCircleFilled(
+                apLedCenter,
+                19.0f + apPulse * 5.0f,
+                ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(
+                        apStatusColor.x,
+                        apStatusColor.y,
+                        apStatusColor.z,
+                        0.06f + apPulse * 0.12f
+                    )
+                ),
+                32
+            );
+
+            // Corps de la LED.
+            apStatusDraw->AddCircleFilled(
+                apLedCenter,
+                11.0f,
+                ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(
+                        apStatusColor.x,
+                        apStatusColor.y,
+                        apStatusColor.z,
+                        0.65f + apPulse * 0.35f
+                    )
+                ),
+                32
+            );
+
+            // Petit reflet blanc.
+            apStatusDraw->AddCircleFilled(
+                ImVec2(apLedCenter.x - 3.0f, apLedCenter.y - 3.0f),
+                3.0f,
+                IM_COL32(235, 250, 255, 160),
+                16
+            );
+
+            ImGui::SetCursorPos(ImVec2(55.0f, 19.0f));
+            ImGui::TextColored(apStatusColor, "%s", apStatusText);
+
+            ImGui::EndChild();
+
+            ImGui::Spacing();
+
+            const bool apCanConnect =
+                apState == APClient::ConnectionState::Disconnected;
+
+            ImGui::BeginDisabled(!apCanConnect);
+
+            bool apConnectRequested = false;
+            if (ImGui::Button("CONNECT", ImVec2(175, 40)))
+            {
+                apConnectRequested = true;
+            }
+
+            // Reflet brillant sur le bouton CONNECT.
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 s = ImGui::GetItemRectSize();
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    ImVec2(p.x + 5.0f, p.y + 4.0f),
+                    ImVec2(p.x + s.x - 5.0f, p.y + s.y * 0.38f),
+                    IM_COL32(180, 225, 255, 55),
+                    10.0f
+                );
+            }
+
+            // AP Metallic Button Border
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 s = ImGui::GetItemRectSize();
+                ImVec2 bottom(p.x + s.x, p.y + s.y);
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                // Bordure exterieure chrome argente bleute.
+                draw->AddRect(
+                    ImVec2(p.x + 1.0f, p.y + 1.0f),
+                    ImVec2(bottom.x - 1.0f, bottom.y - 1.0f),
+                    IM_COL32(160, 215, 245, 235),
+                    13.0f, 0, 2.5f
+                );
+
+                // Contour interieur bleu fonce.
+                draw->AddRect(
+                    ImVec2(p.x + 4.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 4.0f, bottom.y - 4.0f),
+                    IM_COL32(15, 55, 105, 210),
+                    10.0f, 0, 1.5f
+                );
+
+                // Lumiere metallique sur le bord superieur.
+                draw->AddLine(
+                    ImVec2(p.x + 17.0f, p.y + 2.0f),
+                    ImVec2(bottom.x - 17.0f, p.y + 2.0f),
+                    IM_COL32(225, 245, 255, 170),
+                    1.5f
+                );
+            }
+
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+
+            const bool apCanDisconnect =
+                apState == APClient::ConnectionState::Connected;
+
+            ImGui::BeginDisabled(!apCanDisconnect);
+
+            if (ImGui::Button("DISCONNECT", ImVec2(200, 40)))
+            {
+                APClient::Disconnect();
+            }
+
+            // Reflet brillant sur le bouton DISCONNECT.
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 s = ImGui::GetItemRectSize();
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    ImVec2(p.x + 5.0f, p.y + 4.0f),
+                    ImVec2(p.x + s.x - 5.0f, p.y + s.y * 0.38f),
+                    IM_COL32(180, 225, 255, 55),
+                    10.0f
+                );
+            }
+
+            // AP Metallic Button Border
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 s = ImGui::GetItemRectSize();
+                ImVec2 bottom(p.x + s.x, p.y + s.y);
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                // Bordure exterieure chrome argente bleute.
+                draw->AddRect(
+                    ImVec2(p.x + 1.0f, p.y + 1.0f),
+                    ImVec2(bottom.x - 1.0f, bottom.y - 1.0f),
+                    IM_COL32(160, 215, 245, 235),
+                    13.0f, 0, 2.5f
+                );
+
+                // Contour interieur bleu fonce.
+                draw->AddRect(
+                    ImVec2(p.x + 4.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 4.0f, bottom.y - 4.0f),
+                    IM_COL32(15, 55, 105, 210),
+                    10.0f, 0, 1.5f
+                );
+
+                // Lumiere metallique sur le bord superieur.
+                draw->AddLine(
+                    ImVec2(p.x + 17.0f, p.y + 2.0f),
+                    ImVec2(bottom.x - 17.0f, p.y + 2.0f),
+                    IM_COL32(225, 245, 255, 170),
+                    1.5f
+                );
+            }
+
+            ImGui::EndDisabled();
+            ImGui::Spacing();
+
+            // AP Connector : parametres de connexion.
+            static char apServer[128] = {};
+            static char apPort[16] = {};
+            static char apSlot[128] = {};
+            static char apPassword[128] = "";
+            static bool apFieldsInitialized = false;
+
+            if (!apFieldsInitialized)
+            {
+                snprintf(apServer, sizeof(apServer), "%s",
+                    Config::ArchipelagoServer.Value.c_str());
+
+                snprintf(apPort, sizeof(apPort), "%d",
+                    Config::ArchipelagoPort.Value);
+
+                snprintf(apSlot, sizeof(apSlot), "%s",
+                    Config::ArchipelagoSlot.Value.c_str());
+
+                apFieldsInitialized = true;
+            }
+
+            // AP Neon Connection Settings Panel
+            ImGui::TextColored(
+                ImVec4(0.40f, 0.82f, 1.0f, 1.0f),
+                "CONNECTION SETTINGS"
+            );
+
+            ImGui::PushStyleColor(
+                ImGuiCol_ChildBg,
+                ImVec4(0.015f, 0.055f, 0.12f, 0.94f)
+            );
+
+            ImGui::PushStyleColor(
+                ImGuiCol_Border,
+                ImVec4(0.25f, 0.70f, 1.0f, 0.90f)
+            );
+
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.5f);
+            ImGui::PushStyleVar(
+                ImGuiStyleVar_WindowPadding,
+                ImVec2(15.0f, 12.0f)
+            );
+
+            ImGui::BeginChild(
+                "##APConnectionSettings",
+                ImVec2(0.0f, 0.0f),
+                ImGuiChildFlags_Border |
+                ImGuiChildFlags_AutoResizeY
+            );
+
+            // Ligne lumineuse dans la partie superieure du panneau.
+            {
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                ImVec2 p = ImGui::GetWindowPos();
+                ImVec2 s = ImGui::GetWindowSize();
+
+                draw->AddLine(
+                    ImVec2(p.x + 18.0f, p.y + 3.0f),
+                    ImVec2(p.x + s.x - 18.0f, p.y + 3.0f),
+                    IM_COL32(130, 220, 255, 115),
+                    1.5f
+                );
+            }
+
+            ImGui::TextUnformatted("SERVER");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##APServer", apServer, sizeof(apServer));
+
+            ImGui::Spacing();
+
+            ImGui::TextUnformatted("PORT");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##APPort", apPort, sizeof(apPort));
+
+            ImGui::Spacing();
+
+            ImGui::TextUnformatted("PLAYER");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##APSlot", apSlot, sizeof(apSlot));
+
+            ImGui::Spacing();
+
+            ImGui::TextUnformatted("PASSWORD (OPTIONAL)");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText(
+                "##APPassword",
+                apPassword,
+                sizeof(apPassword),
+                ImGuiInputTextFlags_Password
+            );
+
+            ImGui::EndChild();
+
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor(2);
+
+            // AP_F8_USABILITY_V4: visible saving next to connection inputs.
+            ImGui::Spacing();
+            ImGui::TextDisabled("CONNECT saves settings automatically.");
+            // Interdire les changements de configuration pendant une connexion.
+            ImGui::BeginDisabled(!apCanConnect);
+
+            static int apSaveMessage = 0;
+
+            const bool apClickedSaveSettings = ImGui::Button("SAVE SETTINGS", ImVec2(-1, 38));
+            if (apClickedSaveSettings || apConnectRequested)
+            {
+                char* apPortEnd = nullptr;
+                const long parsedPort = std::strtol(apPort, &apPortEnd, 10);
+
+                if (apServer[0] != '\0' &&
+                    apSlot[0] != '\0' &&
+                    apPortEnd != apPort &&
+                    *apPortEnd == '\0' &&
+                    parsedPort >= 1 &&
+                    parsedPort <= 65535)
+                {
+                    Config::ArchipelagoServer.Value = apServer;
+                    Config::ArchipelagoPort.Value = static_cast<int32_t>(parsedPort);
+                    Config::ArchipelagoSlot.Value = apSlot;
+
+                    Config::Save();
+                    apSaveMessage = 1;
+                    if (apConnectRequested)
+                        APClient::Start();
+                }
+                else
+                {
+                    apSaveMessage = 2;
+                }
+            }
+
+            // AP Glossy Metallic Button
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 s = ImGui::GetItemRectSize();
+                ImVec2 bottom(p.x + s.x, p.y + s.y);
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                // Reflet brillant.
+                draw->AddRectFilled(
+                    ImVec2(p.x + 5.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 5.0f, p.y + s.y * 0.38f),
+                    IM_COL32(180, 225, 255, 55),
+                    10.0f
+                );
+
+                // Contour chrome argente bleute.
+                draw->AddRect(
+                    ImVec2(p.x + 1.0f, p.y + 1.0f),
+                    ImVec2(bottom.x - 1.0f, bottom.y - 1.0f),
+                    IM_COL32(160, 215, 245, 235),
+                    13.0f, 0, 2.5f
+                );
+
+                // Contour interieur bleu fonce.
+                draw->AddRect(
+                    ImVec2(p.x + 4.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 4.0f, bottom.y - 4.0f),
+                    IM_COL32(15, 55, 105, 210),
+                    10.0f, 0, 1.5f
+                );
+
+                // Reflet metallique superieur.
+                draw->AddLine(
+                    ImVec2(p.x + 17.0f, p.y + 2.0f),
+                    ImVec2(bottom.x - 17.0f, p.y + 2.0f),
+                    IM_COL32(225, 245, 255, 170),
+                    1.5f
+                );
+            }
+
+            ImGui::EndDisabled();
+
+            if (apSaveMessage == 1)
+            {
+                ImGui::TextColored(
+                    ImVec4(0.30f, 0.95f, 0.55f, 1.0f),
+                    "Settings saved successfully!");
+            }
+            else if (apSaveMessage == 2)
+            {
+                ImGui::TextColored(
+                    ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                    "Invalid server, port or player name.");
+            }
+            // AP_F8_USABILITY_V4_DONE
+            // AP DEATH LINK SETTINGS - Animated toggles
+            ImGui::Spacing();
+            ImGui::TextColored(
+                ImVec4(0.40f, 0.82f, 1.0f, 1.0f),
+                "DEATH LINK"
+            );
+
+            static float apDayToggleAnim = -1.0f;
+            static float apNightToggleAnim = -1.0f;
+
+            auto apDrawDeathLinkToggle =
+                [](const char* label, const char* id,
+                   bool& enabled, float& anim,
+                   ImVec4 activeColor)
+            {
+                if (anim < 0.0f)
+                    anim = enabled ? 1.0f : 0.0f;
+
+                ImGui::PushID(id);
+
+                ImGui::TextUnformatted(label);
+                ImGui::SameLine(440.0f);
+
+                const ImVec2 size(43.0f, 23.0f);
+                const ImVec2 pos = ImGui::GetCursorScreenPos();
+
+                if (ImGui::InvisibleButton("##toggle", size))
+                {
+                    enabled = !enabled;
+                    Config::Save();
+                }
+
+                const float target = enabled ? 1.0f : 0.0f;
+                const float delta = ImGui::GetIO().DeltaTime;
+
+                // Animation fluide sur environ 200 ms.
+                const float speed = 5.0f;
+                const float step = delta * speed;
+
+                if (anim < target)
+                    anim = (anim + step < target) ? anim + step : target;
+                else if (anim > target)
+                    anim = (anim - step > target) ? anim - step : target;
+
+                const ImVec4 offColor(0.30f, 0.35f, 0.43f, 1.0f);
+
+                const ImVec4 color(
+                    offColor.x + (activeColor.x - offColor.x) * anim,
+                    offColor.y + (activeColor.y - offColor.y) * anim,
+                    offColor.z + (activeColor.z - offColor.z) * anim,
+                    1.0f
+                );
+
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                draw->AddRectFilled(
+                    pos,
+                    ImVec2(pos.x + size.x, pos.y + size.y),
+                    ImGui::ColorConvertFloat4ToU32(color),
+                    size.y * 0.5f
+                );
+
+                const float knobX =
+                    pos.x + 11.5f + anim * 20.0f;
+
+                draw->AddCircleFilled(
+                    ImVec2(knobX, pos.y + 11.5f),
+                    8.5f,
+                    IM_COL32(255, 255, 255, 255)
+                );
+
+                ImGui::PopID();
+            };
+
+            apDrawDeathLinkToggle(
+                "Sonic",
+                "DayDeathLink",
+                Config::DeathLinkSonicDay.Value,
+                apDayToggleAnim,
+                ImVec4(0.98f, 0.45f, 0.08f, 1.0f)
+            );
+
+            apDrawDeathLinkToggle(
+                "Werehog",
+                "NightDeathLink",
+                Config::DeathLinkWerehog.Value,
+                apNightToggleAnim,
+                ImVec4(0.58f, 0.20f, 0.92f, 1.0f)
+            );
+
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            // AP CUSTOM MUSIC - Bouton du menu F8.
+            static bool apCustomMusicOpen = false;
+            static bool apCustomMusicVisible = false;
+            static float apCustomMusicAnim = 0.0f;
+
+            if (ImGui::Button("CUSTOM MUSIC", ImVec2(-1, 42)))
+                {
+                    apCustomMusicOpen = true;
+                    apCustomMusicVisible = true;
+                }
+
+            // AP Glossy Metallic CUSTOM MUSIC Button
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 s = ImGui::GetItemRectSize();
+                ImVec2 bottom(p.x + s.x, p.y + s.y);
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                draw->AddRectFilled(
+                    ImVec2(p.x + 5.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 5.0f, p.y + s.y * 0.38f),
+                    IM_COL32(180, 225, 255, 55),
+                    10.0f
+                );
+
+                draw->AddRect(
+                    ImVec2(p.x + 1.0f, p.y + 1.0f),
+                    ImVec2(bottom.x - 1.0f, bottom.y - 1.0f),
+                    IM_COL32(160, 215, 245, 235),
+                    13.0f, 0, 2.5f
+                );
+
+                draw->AddRect(
+                    ImVec2(p.x + 4.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 4.0f, bottom.y - 4.0f),
+                    IM_COL32(15, 55, 105, 210),
+                    10.0f, 0, 1.5f
+                );
+
+                draw->AddLine(
+                    ImVec2(p.x + 17.0f, p.y + 2.0f),
+                    ImVec2(bottom.x - 17.0f, p.y + 2.0f),
+                    IM_COL32(225, 245, 255, 170),
+                    1.5f
+                );
+            }
+
+            ImGui::Spacing();
+
+            // Ouvrir le sous-menu Custom Music.
+            if (apCustomMusicVisible)
+            {
+                const float apAnimSpeed = ImGui::GetIO().DeltaTime / 0.30f;
+
+                if (apCustomMusicOpen)
+                    apCustomMusicAnim += apAnimSpeed;
+                else
+                    apCustomMusicAnim -= apAnimSpeed;
+
+                if (apCustomMusicAnim < 0.0f)
+                    apCustomMusicAnim = 0.0f;
+
+                if (apCustomMusicAnim > 1.0f)
+                    apCustomMusicAnim = 1.0f;
+
+                if (!apCustomMusicOpen && apCustomMusicAnim <= 0.0f)
+                    apCustomMusicVisible = false;
+
+                // Ease-out cubique.
+                const float apT = apCustomMusicAnim;
+                const float apEase = 1.0f - (1.0f - apT) * (1.0f - apT) * (1.0f - apT);
+
+                ImGui::SetNextWindowSize(ImVec2(850.0f, 750.0f), ImGuiCond_Always);
+
+                const ImVec2 apDisplay = ImGui::GetIO().DisplaySize;
+                const ImVec2 apTarget(
+                    (apDisplay.x - 850.0f) * 0.5f,
+                    (apDisplay.y - 750.0f) * 0.5f
+                );
+
+                ImGui::SetNextWindowPos(
+                    ImVec2(apTarget.x - (75.0f * (1.0f - apEase)), apTarget.y),
+                    ImGuiCond_Always
+                );
+
+                ImGui::SetNextWindowBgAlpha(0.98f * apEase);
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, apEase);
+
+                if (ImGui::Begin("Archipelago - Custom Music", &apCustomMusicOpen))
+                {
+                    ImGui::Text("CUSTOM MUSIC");
+                    ImGui::Separator();
+
+                    bool apCustomMusicEnabled = CustomMusic::IsEnabled();
+                    if (ImGui::Checkbox("Enable Custom Music", &apCustomMusicEnabled))
+{
+    CustomMusic::SetEnabled(apCustomMusicEnabled);
+}
+
+                    if (ImGui::BeginTabBar("APCustomMusicTabs"))
+                    {
+                        if (ImGui::BeginTabItem("ACTS"))
+{
+    // AP_DAY_NIGHT_TABS_V1
+    if (ImGui::BeginTabBar("APActsDayNightTabs"))
+    {
+        if (ImGui::BeginTabItem("DAY"))
+        {
+    ImGui::TextColored(
+        ImVec4(0.40f, 0.82f, 1.0f, 1.0f),
+        "DAY STAGE MUSIC"
+    );
+
+    ImGui::TextDisabled("One custom WAV for all Day Acts in each region.");
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    static const char* apDayRegions[] = {
+        "Apotos",
+        "Spagonia",
+        "Mazuri",
+        "Holoska",
+        "Chun-nan",
+        "Adabat",
+        "Shamar",
+        "Empire City",
+        "Eggmanland"
+    };
+
+    // AP_ACTS_CLEAN_LIST_V1 - same single-scroll layout as TOWNS.
+    ImGui::BeginChild("##APDayMusicList", ImVec2(0.0f, 520.0f), true);
+    for (int i = 0; i < 9; ++i)
+    {
+        ImGui::PushID(i);
+        ImGui::Text("%s - DAY", apDayRegions[i]);
+        if (ImGui::Button("Browse WAV...", ImVec2(220.0f, 40.0f)))
+        {
+            if (NFD_Init() == NFD_OKAY)
+            {
+                nfdu8char_t* selectedPath = nullptr;
+                const nfdu8filteritem_t filters[] = { { "WAV Files", "wav" } };
+                const nfdresult_t result = NFD_OpenDialogU8(&selectedPath, filters, 1, nullptr);
+                if (result == NFD_OKAY && selectedPath)
+                {
+                    CustomMusic::SetDayMusicPath(static_cast<CustomMusic::DayRegion>(i), selectedPath);
+                    NFD_FreePathU8(selectedPath);
+                }
+                NFD_Quit();
+            }
+        }
+        const char* selectedWav = CustomMusic::GetDayMusicPath(static_cast<CustomMusic::DayRegion>(i));
+        if (selectedWav && *selectedWav)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.40f, 1.0f, 0.65f, 1.0f), "WAV Selected");
+            ImGui::TextWrapped("%s", selectedWav);
+        }
+        else
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Default music");
+        }
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    // END AP_ACTS_CLEAN_LIST_V1
+        ImGui::EndTabItem();
+            }
+
+        if (ImGui::BeginTabItem("NIGHT"))
+        {
+            ImGui::TextColored(
+                ImVec4(0.65f, 0.45f, 1.0f, 1.0f),
+                "NIGHT STAGE MUSIC"
+            );
+            ImGui::TextDisabled("One custom WAV for all Night Acts in each region.");
+
+            // AP_NIGHT_BROWSE_UI_V1
+            ImGui::Separator();
+            ImGui::BeginChild("##APNightMusicList", ImVec2(0.0f, 520.0f), true);
+
+            static const char* apNightRegions[] = {
+                "Apotos", "Spagonia", "Mazuri",
+                "Holoska", "Chun-nan", "Adabat",
+                "Shamar", "Empire City", "Eggmanland"
+            };
+
+            for (int i = 0; i < 9; ++i)
+            {
+                ImGui::PushID(i);
+
+                ImGui::TextColored(
+                    ImVec4(0.65f, 0.45f, 1.0f, 1.0f),
+                    "%s - NIGHT",
+                    apNightRegions[i]
+                );
+
+                if (ImGui::Button("Browse WAV...", ImVec2(220.0f, 40.0f)))
+                {
+                    if (NFD_Init() == NFD_OKAY)
+                    {
+                        nfdu8char_t* selectedPath = nullptr;
+
+                        const nfdu8filteritem_t filters[] = {
+                            { "WAV Files", "wav" }
+                        };
+
+                        const nfdresult_t result =
+                            NFD_OpenDialogU8(&selectedPath, filters, 1, nullptr);
+
+                        if (result == NFD_OKAY && selectedPath)
+                        {
+                            CustomMusic::SetNightMusicPath(
+                                static_cast<CustomMusic::DayRegion>(i),
+                                selectedPath
+                            );
+
+                            NFD_FreePathU8(selectedPath);
+                        }
+
+                        NFD_Quit();
+                    }
+                }
+
+                const char* selectedWav =
+                    CustomMusic::GetNightMusicPath(
+                        static_cast<CustomMusic::DayRegion>(i)
+                    );
+
+                if (selectedWav && *selectedWav)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(
+                        ImVec4(0.40f, 1.0f, 0.65f, 1.0f),
+                        "WAV Selected"
+                    );
+                    ImGui::TextWrapped("%s", selectedWav);
+                }
+                else
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("Default music");
+                }
+
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+
+            ImGui::EndChild();
+            // END AP_NIGHT_BROWSE_UI_V1
+        ImGui::EndTabItem();
+        }
+    ImGui::EndTabBar();
+    }
+    // END AP_DAY_NIGHT_TABS_V1
+ImGui::EndTabItem();
+}
+if (ImGui::BeginTabItem("BOSSES"))
+                        {
+                            // AP_BOSS_MUSIC_V1
+                            ImGui::Text("Custom WAV for boss battles.");
+                            ImGui::Separator();
+                            static const char* bossNames[] = {
+                                "Boss Day", "Boss Night", "Boss Night - Eggmanland", "Final Boss - Air Phase"
+                            };
+                            ImGui::BeginChild("##APBossMusicList", ImVec2(0.0f, 520.0f), true);
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                ImGui::PushID(i);
+                                ImGui::Text("%s", bossNames[i]);
+                                if (ImGui::Button("Browse WAV...", ImVec2(220.0f, 40.0f)))
+                                {
+                                    if (NFD_Init() == NFD_OKAY)
+                                    {
+                                        nfdu8char_t* selectedPath = nullptr;
+                                        const nfdu8filteritem_t filters[] = { { "WAV Files", "wav" } };
+                                        const nfdresult_t result = NFD_OpenDialogU8(&selectedPath, filters, 1, nullptr);
+                                        if (result == NFD_OKAY && selectedPath)
+                                        {
+                                            CustomMusic::SetBossMusicPath(static_cast<CustomMusic::BossTrack>(i), selectedPath);
+                                            NFD_FreePathU8(selectedPath);
+                                        }
+                                        NFD_Quit();
+                                    }
+                                }
+                                const char* selectedWav = CustomMusic::GetBossMusicPath(static_cast<CustomMusic::BossTrack>(i));
+                                if (selectedWav && *selectedWav)
+                                {
+                                    ImGui::SameLine();
+                                    ImGui::TextColored(ImVec4(0.40f, 1.0f, 0.65f, 1.0f), "WAV Selected");
+                                    ImGui::TextWrapped("%s", selectedWav);
+                                }
+                                else
+                                {
+                                    ImGui::SameLine();
+                                    ImGui::TextDisabled("Default music");
+                                }
+                                ImGui::Separator();
+                                ImGui::PopID();
+                            }
+                            ImGui::EndChild();
+                            ImGui::EndTabItem();
+                        }
+
+                        if (ImGui::BeginTabItem("TOWNS"))
+                        {
+                            // AP_TOWN_BROWSE_UI_V2
+                            ImGui::Text("Custom WAV for Day and Night towns.");
+                            ImGui::Separator();
+                            static const char* townNames[] = {
+                                "Apotos - Day", "Apotos - Night",
+                                "Spagonia - Day", "Spagonia - Night",
+                                "Mazuri - Day", "Mazuri - Night",
+                                "Chun-nan - Day", "Chun-nan - Night",
+                                "Holoska - Day", "Holoska - Night",
+                                "Adabat - Day", "Adabat - Night",
+                                "Shamar - Day", "Shamar - Night",
+                                "Empire City - Day", "Empire City - Night",
+                                "Eggmanland - Day"
+                            };
+                            ImGui::BeginChild("##APTownMusicList", ImVec2(0.0f, 520.0f), true);
+                            for (int i = 0; i < 17; ++i)
+                            {
+                                ImGui::PushID(i);
+                                ImGui::Text("%s", townNames[i]);
+                                if (ImGui::Button("Browse WAV...", ImVec2(220.0f, 40.0f)))
+                                {
+                                    if (NFD_Init() == NFD_OKAY)
+                                    {
+                                        nfdu8char_t* selectedPath = nullptr;
+                                        const nfdu8filteritem_t filters[] = { { "WAV Files", "wav" } };
+                                        const nfdresult_t result = NFD_OpenDialogU8(&selectedPath, filters, 1, nullptr);
+                                        if (result == NFD_OKAY && selectedPath)
+                                        {
+                                            CustomMusic::SetTownMusicPath(static_cast<CustomMusic::TownTrack>(i), selectedPath);
+                                            NFD_FreePathU8(selectedPath);
+                                        }
+                                        NFD_Quit();
+                                    }
+                                }
+                                const char* selectedWav = CustomMusic::GetTownMusicPath(static_cast<CustomMusic::TownTrack>(i));
+                                if (selectedWav && *selectedWav)
+                                {
+                                    ImGui::SameLine();
+                                    ImGui::TextColored(ImVec4(0.40f, 1.0f, 0.65f, 1.0f), "WAV Selected");
+                                    ImGui::TextWrapped("%s", selectedWav);
+                                }
+                                else
+                                {
+                                    ImGui::SameLine();
+                                    ImGui::TextDisabled("Default music");
+                                }
+                                ImGui::Separator();
+                                ImGui::PopID();
+                            }
+                            ImGui::EndChild();
+                            // END AP_TOWN_BROWSE_UI_V2
+                            ImGui::EndTabItem();
+                        }
+
+// AP_LOOP_EDITOR_WAVEFORM_V1
+                        if (ImGui::BeginTabItem("LOOP EDITOR"))
+                        {
+                            static std::string loopEditorPath;
+                            static std::vector<float> loopEditorPeaks;
+                            static std::int64_t loopEditorDurationMs = 0;
+                            static std::int64_t loopEditorStartMs = 0;
+                            static std::int64_t loopEditorEndMs = 0;
+                            static bool loopEditorEnabled = true;
+                            static float loopEditorZoom = 1.0f;
+                            static float loopEditorOffset = 0.0f;
+                            static int loopEditorDrag = 0;
+                            static std::string loopEditorMessage;
+                            // AP_AUDIO_PREVIEW_V1: isolated SDL audio device; never uses the game's Mix_Music channel.
+                            static SDL_AudioDeviceID previewDevice = 0;
+                            static Uint8* previewWavData = nullptr;
+                            static Uint32 previewWavBytes = 0;
+                            static SDL_AudioSpec previewSpec{};
+                            static Uint64 previewCursor = 0; // next byte to queue
+                            static bool previewPlaying = false;
+                            static bool previewPaused = false;
+                            static bool previewTestLoop = false;
+                            auto previewStop = [&]() {
+                                if (previewDevice) { SDL_ClearQueuedAudio(previewDevice); SDL_CloseAudioDevice(previewDevice); previewDevice = 0; }
+                                if (previewWavData) { SDL_FreeWAV(previewWavData); previewWavData = nullptr; }
+                                previewWavBytes = 0;
+                                previewCursor = 0;
+                                previewPlaying = false;
+                                previewPaused = false;
+                                previewTestLoop = false;
+                            };
+                            auto previewBytesPerSecond = [&]() -> Uint64 {
+                                return static_cast<Uint64>(previewSpec.freq) * previewSpec.channels * (SDL_AUDIO_BITSIZE(previewSpec.format) / 8);
+                            };
+                            auto previewSeek = [&](std::int64_t ms) {
+                                if (!previewDevice || !previewWavData) return;
+                                const Uint64 frameSize = static_cast<Uint64>(previewSpec.channels) * (SDL_AUDIO_BITSIZE(previewSpec.format) / 8);
+                                const Uint64 bytePos = static_cast<Uint64>(std::max<std::int64_t>(0, ms)) * previewBytesPerSecond() / 1000;
+                                previewCursor = std::min<Uint64>(previewWavBytes, frameSize ? bytePos / frameSize * frameSize : 0);
+                                SDL_ClearQueuedAudio(previewDevice);
+                            };
+                            if (ImGui::Button("Open WAV...", ImVec2(180.0f, 38.0f)))
+                            {
+                                if (NFD_Init() == NFD_OKAY)
+                                {
+                                    nfdu8char_t* selectedPath = nullptr;
+                                    const nfdu8filteritem_t filters[] = {{"WAV Files", "wav"}};
+                                    const nfdresult_t result = NFD_OpenDialogU8(&selectedPath, filters, 1, nullptr);
+                                    if (result == NFD_OKAY && selectedPath)
+                                    {
+                                        previewStop();
+                                        loopEditorPath = selectedPath;
+                                        NFD_FreePathU8(selectedPath);
+                                        loopEditorPeaks.clear();
+                                        loopEditorDurationMs = 0;
+                                        loopEditorZoom = 1.0f;
+                                        loopEditorOffset = 0.0f;
+                                        loopEditorMessage.clear();
+                                        SDL_AudioSpec wavSpec{};
+                                        Uint8* wavData = nullptr;
+                                        Uint32 wavBytes = 0;
+                                        if (SDL_LoadWAV(loopEditorPath.c_str(), &wavSpec, &wavData, &wavBytes))
+                                        {
+                                            const int bits = SDL_AUDIO_BITSIZE(wavSpec.format);
+                                            const int bytesPerSample = bits / 8;
+                                            const int frameBytes = bytesPerSample * wavSpec.channels;
+                                            const std::size_t frames = frameBytes > 0 ? wavBytes / frameBytes : 0;
+                                            if (wavSpec.freq > 0 && frames > 0 && (bits == 8 || bits == 16 || bits == 32) &&
+                                                (!SDL_AUDIO_ISFLOAT(wavSpec.format) || bits == 32))
+                                            {
+                                                loopEditorDurationMs = static_cast<std::int64_t>(frames * 1000ULL / static_cast<unsigned>(wavSpec.freq));
+                                                const std::size_t bins = 16000;
+                                                loopEditorPeaks.assign(bins, 0.0f);
+                                                for (std::size_t bin = 0; bin < bins; ++bin)
+                                                {
+                                                    const std::size_t first = bin * frames / bins;
+                                                    const std::size_t last = (bin + 1) * frames / bins;
+                                                    float peak = 0.0f;
+                                                    const std::size_t stride = std::max<std::size_t>(1, (last - first) / 32);
+                                                    for (std::size_t f = first; f < last; f += stride)
+                                                    {
+                                                        for (int ch = 0; ch < wavSpec.channels; ++ch)
+                                                        {
+                                                            const Uint8* p = wavData + f * frameBytes + ch * bytesPerSample;
+                                                            float sample = 0.0f;
+                                                            if (bits == 8)
+                                                                sample = SDL_AUDIO_ISSIGNED(wavSpec.format) ? std::abs(static_cast<float>(static_cast<std::int8_t>(*p)) / 128.0f) : std::abs((static_cast<float>(*p) - 128.0f) / 128.0f);
+                                                            else if (bits == 16)
+                                                            {
+                                                                std::uint16_t v = SDL_AUDIO_ISBIGENDIAN(wavSpec.format) ? (static_cast<std::uint16_t>(p[0]) << 8 | p[1]) : (static_cast<std::uint16_t>(p[1]) << 8 | p[0]);
+                                                                sample = std::abs(static_cast<float>(static_cast<std::int16_t>(v)) / 32768.0f);
+                                                            }
+                                                            else if (SDL_AUDIO_ISFLOAT(wavSpec.format))
+                                                            {
+                                                                float v = 0.0f;
+                                                                std::memcpy(&v, p, sizeof(v));
+                                                                sample = std::isfinite(v) ? std::min(1.0f, std::abs(v)) : 0.0f;
+                                                            }
+                                                            else
+                                                            {
+                                                                std::uint32_t v = 0;
+                                                                std::memcpy(&v, p, sizeof(v));
+                                                                sample = SDL_AUDIO_ISSIGNED(wavSpec.format) ? std::abs(static_cast<double>(static_cast<std::int32_t>(v)) / 2147483648.0) : std::abs((static_cast<double>(v) - 2147483648.0) / 2147483648.0);
+                                                            }
+                                                            peak = std::max(peak, sample);
+                                                        }
+                                                    }
+                                                    loopEditorPeaks[bin] = std::min(1.0f, peak);
+                                                }
+                                                loopEditorStartMs = 0;
+                                                loopEditorEndMs = loopEditorDurationMs;
+                                                loopEditorEnabled = true;
+                                                CustomMusic::LoopPoints saved{};
+                                                if (CustomMusic::GetSavedLoop(loopEditorPath.c_str(), saved))
+                                                {
+                                                    loopEditorStartMs = std::clamp(saved.startMs, std::int64_t(0), loopEditorDurationMs);
+                                                    loopEditorEndMs = std::clamp(saved.endMs, std::int64_t(0), loopEditorDurationMs);
+                                                    loopEditorEnabled = saved.enabled;
+                                                    loopEditorMessage = "Saved markers loaded.";
+                                                }
+                                            }
+                                            else loopEditorMessage = "Unsupported WAV sample format.";
+                                            SDL_FreeWAV(wavData);
+                                        }
+                                        else loopEditorMessage = "Could not open WAV file.";
+                                    }
+                                    NFD_Quit();
+                                }
+                            }
+                            if (!loopEditorPath.empty()) ImGui::TextWrapped("%s", loopEditorPath.c_str());
+                            if (!loopEditorPeaks.empty() && loopEditorDurationMs > 0)
+                            {
+                                // Separate preview device: SDL_mixer/gameplay music is not interrupted.
+                                if (previewPlaying && previewDevice && !previewPaused)
+                                {
+                                    const Uint64 bytesPerSecond = previewBytesPerSecond();
+                                    const Uint64 frameBytes = static_cast<Uint64>(previewSpec.channels) * (SDL_AUDIO_BITSIZE(previewSpec.format) / 8);
+                                    const Uint64 queued = SDL_GetQueuedAudioSize(previewDevice);
+                                    const Uint64 targetQueue = bytesPerSecond / 8; // ~125 ms, low latency
+                                    if (queued < targetQueue && bytesPerSecond && frameBytes)
+                                    {
+                                        const Uint64 loopStartByte = (static_cast<Uint64>(loopEditorStartMs) * bytesPerSecond / 1000 / frameBytes) * frameBytes;
+                                        const Uint64 loopEndByte = (static_cast<Uint64>(loopEditorEndMs) * bytesPerSecond / 1000 / frameBytes) * frameBytes;
+                                        const Uint64 boundary = previewTestLoop && loopEndByte > loopStartByte ? std::min<Uint64>(loopEndByte, previewWavBytes) : previewWavBytes;
+                                        if (previewCursor >= boundary)
+                                        {
+                                            if (previewTestLoop && loopEndByte > loopStartByte) previewCursor = loopStartByte;
+                                            else { previewPlaying = false; SDL_PauseAudioDevice(previewDevice, 1); }
+                                        }
+                                        if (previewPlaying && previewCursor < boundary)
+                                        {
+                                            const Uint64 count = std::min<Uint64>(boundary - previewCursor, targetQueue - queued);
+                                            const Uint64 aligned = count / frameBytes * frameBytes;
+                                            if (aligned && SDL_QueueAudio(previewDevice, previewWavData + previewCursor, static_cast<Uint32>(aligned)) == 0)
+                                                previewCursor += aligned;
+                                        }
+                                    }
+                                }
+                                const Uint64 previewQueued = previewDevice ? SDL_GetQueuedAudioSize(previewDevice) : 0;
+                                const Uint64 previewBps = previewBytesPerSecond();
+                                const Uint64 playedBytes = previewCursor > previewQueued ? previewCursor - previewQueued : 0;
+                                const std::int64_t previewPositionMs = previewBps ? static_cast<std::int64_t>(playedBytes * 1000 / previewBps) : 0;
+                                ImGui::Text("Duration: %.3f seconds", loopEditorDurationMs / 1000.0);
+                                ImGui::SliderFloat("Zoom", &loopEditorZoom, 1.0f, 100.0f, "%.1fx", ImGuiSliderFlags_Logarithmic);
+                                const float visibleFraction = 1.0f / loopEditorZoom;
+                                loopEditorOffset = std::clamp(loopEditorOffset, 0.0f, 1.0f - visibleFraction);
+                                ImGui::SliderFloat("Scroll", &loopEditorOffset, 0.0f, 1.0f - visibleFraction, "%.4f");
+                                const ImVec2 canvasSize(std::max(250.0f, ImGui::GetContentRegionAvail().x), 220.0f);
+                                const ImVec2 origin = ImGui::GetCursorScreenPos();
+                                ImGui::InvisibleButton("##LoopWaveform", canvasSize);
+                                const bool hovered = ImGui::IsItemHovered();
+                                ImDrawList* draw = ImGui::GetWindowDrawList();
+                                const ImVec2 end(origin.x + canvasSize.x, origin.y + canvasSize.y);
+                                draw->AddRectFilled(origin, end, IM_COL32(14, 20, 32, 255));
+                                const float center = origin.y + canvasSize.y * 0.5f;
+                                draw->AddLine(ImVec2(origin.x, center), ImVec2(end.x, center), IM_COL32(90, 105, 130, 255));
+                                const int width = static_cast<int>(canvasSize.x);
+                                for (int x = 0; x < width; ++x)
+                                {
+                                    const float fraction = loopEditorOffset + (static_cast<float>(x) / canvasSize.x) * visibleFraction;
+                                    const std::size_t index = std::min(loopEditorPeaks.size() - 1, static_cast<std::size_t>(fraction * loopEditorPeaks.size()));
+                                    const float amplitude = loopEditorPeaks[index] * (canvasSize.y * 0.44f);
+                                    draw->AddLine(ImVec2(origin.x + x, center - amplitude), ImVec2(origin.x + x, center + amplitude), IM_COL32(75, 190, 235, 255));
+                                }
+                                auto markerX = [&](std::int64_t ms) { return origin.x + (static_cast<float>(ms) / loopEditorDurationMs - loopEditorOffset) / visibleFraction * canvasSize.x; };
+                                const float startX = markerX(loopEditorStartMs);
+                                const float endX = markerX(loopEditorEndMs);
+                                if (startX >= origin.x && startX <= end.x) draw->AddLine(ImVec2(startX, origin.y), ImVec2(startX, end.y), IM_COL32(70, 255, 120, 255), 3.0f);
+                                if (endX >= origin.x && endX <= end.x) draw->AddLine(ImVec2(endX, origin.y), ImVec2(endX, end.y), IM_COL32(255, 125, 80, 255), 3.0f);
+                                if (previewDevice)
+                                {
+                                    const float playX = markerX(previewPositionMs);
+                                    if (playX >= origin.x && playX <= end.x)
+                                    {
+                                        draw->AddLine(ImVec2(playX, origin.y), ImVec2(playX, end.y), IM_COL32(255, 255, 255, 255), 2.0f);
+                                        draw->AddCircleFilled(ImVec2(playX, origin.y + 7.0f), 5.0f, IM_COL32(255, 255, 255, 255));
+                                    }
+                                }
+                                if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                                {
+                                    const float mouseX = ImGui::GetIO().MousePos.x;
+                                    loopEditorDrag = std::abs(mouseX - startX) <= std::abs(mouseX - endX) ? 1 : 2;
+                                }
+                                if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) loopEditorDrag = 0;
+                                if (loopEditorDrag != 0 && ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                                {
+                                    const float fraction = std::clamp(loopEditorOffset + (ImGui::GetIO().MousePos.x - origin.x) / canvasSize.x * visibleFraction, 0.0f, 1.0f);
+                                    const std::int64_t ms = static_cast<std::int64_t>(fraction * loopEditorDurationMs);
+                                    if (loopEditorDrag == 1) loopEditorStartMs = std::min(ms, loopEditorEndMs);
+                                    else loopEditorEndMs = std::max(ms, loopEditorStartMs);
+                                }
+                                // Right-click the waveform to seek without moving loop markers.
+                                if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && previewDevice)
+                                {
+                                    const float fraction = std::clamp(loopEditorOffset + (ImGui::GetIO().MousePos.x - origin.x) / canvasSize.x * visibleFraction, 0.0f, 1.0f);
+                                    previewSeek(static_cast<std::int64_t>(fraction * loopEditorDurationMs));
+                                }
+                                ImGui::Text("Preview: %02lld:%06.3f / %02lld:%06.3f", static_cast<long long>(previewPositionMs / 60000), (previewPositionMs % 60000) / 1000.0, static_cast<long long>(loopEditorDurationMs / 60000), (loopEditorDurationMs % 60000) / 1000.0);
+                                if (ImGui::Button(previewPlaying && !previewPaused ? "PAUSE" : "PLAY", ImVec2(100.0f, 34.0f)))
+                                {
+                                    if (!previewDevice)
+                                    {
+                                        SDL_AudioSpec desired{};
+                                        if (SDL_LoadWAV(loopEditorPath.c_str(), &desired, &previewWavData, &previewWavBytes))
+                                        {
+                                            previewSpec = desired;
+                                            previewSpec.callback = nullptr;
+                                            previewDevice = SDL_OpenAudioDevice(nullptr, 0, &previewSpec, nullptr, 0);
+                                            if (!previewDevice) { loopEditorMessage = std::string("Preview device error: ") + SDL_GetError(); previewStop(); }
+                                        }
+                                        else loopEditorMessage = std::string("Preview WAV error: ") + SDL_GetError();
+                                    }
+                                    if (previewDevice)
+                                    {
+                                        if (!previewPlaying && previewCursor >= previewWavBytes) previewSeek(0);
+                                        previewPlaying = true;
+                                        previewPaused = !previewPaused && SDL_GetQueuedAudioSize(previewDevice) > 0 ? true : false;
+                                        SDL_PauseAudioDevice(previewDevice, previewPaused ? 1 : 0);
+                                    }
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("STOP", ImVec2(100.0f, 34.0f))) previewStop();
+                                ImGui::SameLine();
+                                if (ImGui::Button(previewTestLoop ? "TEST LOOP: ON" : "TEST LOOP", ImVec2(150.0f, 34.0f)))
+                                {
+                                    previewTestLoop = !previewTestLoop;
+                                    if (previewTestLoop && previewDevice) previewSeek(std::max<std::int64_t>(loopEditorStartMs, loopEditorEndMs - 2500));
+                                }
+                                if (ImGui::Button("SET START HERE")) loopEditorStartMs = std::clamp(previewPositionMs, std::int64_t(0), loopEditorEndMs);
+                                ImGui::SameLine();
+                                if (ImGui::Button("SET END HERE")) loopEditorEndMs = std::clamp(previewPositionMs, loopEditorStartMs, loopEditorDurationMs);
+                                ImGui::TextDisabled("Right-click waveform to seek. Test Loop repeats between green and orange markers.");
+                                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "GREEN = Loop Start");
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "ORANGE = Loop End");
+                                ImGui::TextDisabled("Click or drag the nearest marker. Zoom and scroll for precision.");
+                                double startSeconds = loopEditorStartMs / 1000.0;
+                                double endSeconds = loopEditorEndMs / 1000.0;
+                                if (ImGui::InputDouble("Loop Start (seconds)", &startSeconds, 0.001, 0.1, "%.3f"))
+                                    loopEditorStartMs = std::clamp(static_cast<std::int64_t>(startSeconds * 1000.0), std::int64_t(0), loopEditorEndMs);
+                                if (ImGui::InputDouble("Loop End (seconds)", &endSeconds, 0.001, 0.1, "%.3f"))
+                                    loopEditorEndMs = std::clamp(static_cast<std::int64_t>(endSeconds * 1000.0), loopEditorStartMs, loopEditorDurationMs);
+                                ImGui::Checkbox("Enable this loop", &loopEditorEnabled);
+                                if (ImGui::Button("SAVE LOOP", ImVec2(200.0f, 42.0f)))
+                                {
+                                    if (loopEditorEndMs > loopEditorStartMs && CustomMusic::SaveLoop(loopEditorPath.c_str(), loopEditorStartMs, loopEditorEndMs, loopEditorEnabled))
+                                        loopEditorMessage = "Loop saved to CustomMusic/loops.ini!";
+                                    else loopEditorMessage = "Save failed: check marker positions and file permissions.";
+                                }
+                                ImGui::TextDisabled("Audio preview only. Applying saved loops to gameplay music comes next.");
+                            }
+                            if (!loopEditorMessage.empty()) ImGui::TextWrapped("%s", loopEditorMessage.c_str());
+                            ImGui::EndTabItem();
+                        }
+                        // END AP_LOOP_EDITOR_WAVEFORM_V1
+
+                        ImGui::EndTabBar();
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Loop Editor: waveform, audio preview and persistent markers. Gameplay looping comes next.");
+                }
+
+                ImGui::End();
+                ImGui::PopStyleVar();
+            }
+
+            ImGui::Spacing();
+
+            // AP Bug Report - bouton metallique.
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            static std::string apBugReportPath;
+
+            if (ImGui::Button("BUG REPORT", ImVec2(-1, 38)))
+            {
+                apBugReportPath = os::logger::ExportBugReport();
+                ImGui::OpenPopup("AP Bug Report");
+            }
+
+            // Meme finition metallique que SAVE SETTINGS.
+            {
+                ImVec2 p = ImGui::GetItemRectMin();
+                ImVec2 s = ImGui::GetItemRectSize();
+                ImVec2 bottom(p.x + s.x, p.y + s.y);
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+
+                draw->AddRectFilled(
+                    ImVec2(p.x + 5.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 5.0f, p.y + s.y * 0.38f),
+                    IM_COL32(180, 225, 255, 55),
+                    10.0f
+                );
+
+                draw->AddRect(
+                    ImVec2(p.x + 1.0f, p.y + 1.0f),
+                    ImVec2(bottom.x - 1.0f, bottom.y - 1.0f),
+                    IM_COL32(160, 215, 245, 235),
+                    13.0f, 0, 2.5f
+                );
+
+                draw->AddRect(
+                    ImVec2(p.x + 4.0f, p.y + 4.0f),
+                    ImVec2(bottom.x - 4.0f, bottom.y - 4.0f),
+                    IM_COL32(15, 55, 105, 210),
+                    10.0f, 0, 1.5f
+                );
+
+                draw->AddLine(
+                    ImVec2(p.x + 17.0f, p.y + 2.0f),
+                    ImVec2(bottom.x - 17.0f, p.y + 2.0f),
+                    IM_COL32(225, 245, 255, 170),
+                    1.5f
+                );
+            }
+
+            if (ImGui::BeginPopupModal(
+                "AP Bug Report", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                if (!apBugReportPath.empty())
+                {
+                    ImGui::TextColored(
+                        ImVec4(0.30f, 0.95f, 0.55f, 1.0f),
+                        "BUG REPORT CREATED!");
+
+                    ImGui::Spacing();
+                    ImGui::TextWrapped("Log saved to:");
+                    ImGui::TextWrapped("%s", apBugReportPath.c_str());
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::TextWrapped(
+                        "Please send this log file to Zakary on Discord.");
+                }
+                else
+                {
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                        "Failed to create bug report.");
+
+                    ImGui::TextWrapped(
+                        "Please check the game folder permissions.");
+                }
+
+                if (ImGui::Button("OK", ImVec2(180, 38)))
+                    ImGui::CloseCurrentPopup();
+
+                ImGui::EndPopup();
+            }
+            // AP SPECIAL THANKS - Credits dans une fenetre independante.
+            if (ImGui::Button("SPECIAL THANKS", ImVec2(-1, 42)))
+                ImGui::OpenPopup("AP Special Thanks");
+
+            // AP SPECIAL THANKS - Bouton metallique et contour arc-en-ciel anime.
+            {
+                const ImVec2 p = ImGui::GetItemRectMin();
+                const ImVec2 q = ImGui::GetItemRectMax();
+                const float w = q.x - p.x;
+                const float h = q.y - p.y;
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const float t = static_cast<float>(ImGui::GetTime());
+                const bool hovered = ImGui::IsItemHovered();
+                const float pulse = 0.5f + 0.5f * sinf(t * 2.4f);
+                const float brightness = (hovered ? 1.0f : 0.65f) + 0.18f * pulse;
+
+                // Reflet metallique discret, comme les autres boutons F8.
+                draw->AddRectFilled(
+                    ImVec2(p.x + 5.0f, p.y + 4.0f),
+                    ImVec2(q.x - 5.0f, p.y + h * 0.39f),
+                    IM_COL32(185, 225, 255, 52), 9.0f
+                );
+                draw->AddRect(
+                    ImVec2(p.x + 3.0f, p.y + 3.0f),
+                    ImVec2(q.x - 3.0f, q.y - 3.0f),
+                    IM_COL32(175, 205, 235, 130), 8.0f, 0, 1.0f
+                );
+
+                // LiserÃ© arc-en-ciel mobile sur les quatre cotes du bouton.
+                // Un halo doux et un trait net restent a l'interieur du rectangle.
+                const float inset = 1.5f;
+                const float left = p.x + inset, right = q.x - inset;
+                const float top = p.y + inset, bottom = q.y - inset;
+                const float iw = right - left, ih = bottom - top;
+                const float perimeter = 2.0f * (iw + ih);
+                const int segments = 120;
+                for (int i = 0; i < segments; ++i)
+                {
+                    const float d0 = perimeter * i / segments;
+                    const float d1 = perimeter * (i + 1) / segments;
+                    auto pointOnEdge = [&](float d) -> ImVec2
+                    {
+                        if (d <= iw) return ImVec2(left + d, top);
+                        d -= iw;
+                        if (d <= ih) return ImVec2(right, top + d);
+                        d -= ih;
+                        if (d <= iw) return ImVec2(right - d, bottom);
+                        d -= iw;
+                        return ImVec2(left, bottom - d);
+                    };
+                    const ImVec2 a = pointOnEdge(d0);
+                    const ImVec2 b = pointOnEdge(d1);
+                    float hue = (static_cast<float>(i) / segments) - t * 0.09f;
+                    hue -= floorf(hue);
+                    const ImVec4 rgb = ImColor::HSV(hue, 0.85f, 1.0f);
+                    const ImU32 glow = ImGui::ColorConvertFloat4ToU32(
+                        ImVec4(rgb.x, rgb.y, rgb.z, 0.13f * brightness));
+                    const ImU32 rim = ImGui::ColorConvertFloat4ToU32(
+                        ImVec4(rgb.x, rgb.y, rgb.z, 0.88f * brightness));
+                    draw->AddLine(a, b, glow, 5.0f);
+                    draw->AddLine(a, b, rim, 2.0f);
+                }
+            }
+
+            ImGui::SetNextWindowSize(ImVec2(510.0f, 650.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::BeginPopupModal("AP Special Thanks", nullptr, ImGuiWindowFlags_NoCollapse))
+            {
+                ImGui::TextColored(ImVec4(0.40f, 0.82f, 1.0f, 1.0f), "SPECIAL THANKS");
+                ImGui::TextWrapped("Thank you to everyone who supported this project!");
+                ImGui::Separator();
+                ImGui::BeginChild("##APThanksNames", ImVec2(0.0f, -58.0f), true);
+                ImGui::TextUnformatted("absoluteSpacehead");
+                ImGui::TextUnformatted("Adly66");
+                ImGui::TextUnformatted("Astreachan");
+                ImGui::TextUnformatted("Azzy");
+                ImGui::TextUnformatted("ChrisCTRD");
+                ImGui::TextUnformatted("Cutless");
+                ImGui::TextUnformatted("DonGT");
+                ImGui::TextUnformatted("Enerjak");
+                ImGui::TextUnformatted("Flocon");
+                ImGui::TextUnformatted("girovan1");
+                ImGui::TextUnformatted("HothRaka");
+                ImGui::TextUnformatted("Hubster");
+                ImGui::TextUnformatted("HumMation");
+                ImGui::TextUnformatted("JEJE");
+                ImGui::TextUnformatted("Kalib_32");
+                ImGui::TextUnformatted("Kerolune");
+                ImGui::TextUnformatted("Kombos22");
+                ImGui::TextUnformatted("Lara the Lazy Prodigy (Harry)");
+                ImGui::TextUnformatted("Robin");
+                ImGui::TextUnformatted("Scrungip");
+                ImGui::TextUnformatted("Shadyrix");
+                ImGui::TextUnformatted("SimplyTJ");
+                ImGui::TextUnformatted("Sonicboy90");
+                ImGui::TextUnformatted("Stella Rorae");
+                ImGui::TextUnformatted("strugen");
+                ImGui::TextUnformatted("TwinklePillar");
+                ImGui::TextUnformatted("Valyssa");
+                ImGui::TextUnformatted("Vaporeon");
+                ImGui::EndChild();
+                if (ImGui::Button("CLOSE", ImVec2(-1, 40)))
+                    ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+            ImGui::Spacing();
+
+            // AP_F8_REORDER_V1_DONE
+            ImGui::TextDisabled("F8: Show / Hide");
+        }
+
+        ImGui::End();
+        ImGui::PopFont();
+
+        ImGui::PopStyleColor(12);
+        ImGui::PopStyleVar(6);
+    }
     AchievementMenu::Draw();
     OptionsMenu::Draw();
     AchievementOverlay::Draw();
@@ -2602,6 +4644,7 @@ static void DrawImGui()
 
     assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
 
+    DrawAPMedalsHud();
     DrawFPS();
     DrawProfiler();
     ImGui::Render();
@@ -7880,3 +9923,10 @@ GUEST_FUNCTION_STUB(sub_82BEA018);
 GUEST_FUNCTION_STUB(sub_82BEA7C0);
 GUEST_FUNCTION_STUB(sub_82BFFF88); // D3DXFilterTexture
 GUEST_FUNCTION_STUB(sub_82BD96D0);
+
+
+
+
+
+
+

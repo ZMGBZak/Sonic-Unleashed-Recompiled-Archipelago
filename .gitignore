@@ -407,3 +407,33 @@ FodyWeavers.xsd
 # CMake Files
 **/cmake-build-debug
 **/CMakeCache.txt
+# === ARCHIPELAGO LOCAL DEVELOPMENT BACKUPS ===
+*.bak
+*.bak.*
+*.backup
+*.backup.*
+*.backup_*
+*.backup-*
+*.old
+*.orig
+*.before_*.bak
+*.before-*.bak
+*.FullRingSafetyBackup_*
+*.hotdog-backup
+*.inventory-*-backup
+*_Backup_*/
+*_Backups/
+AP_*Backup*/
+AP_*Backups/
+_AP_BACKUPS/
+**/AP_Backups/
+# === END ARCHIPELAGO BACKUPS ===
+
+# Archipelago additional backup patterns
+*.bak_*
+*.bak-*
+*.backup_*
+*.backup-*
+*.before_*
+*.before-*
+*.zip

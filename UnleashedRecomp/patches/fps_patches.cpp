@@ -1,8 +1,11 @@
+#include <os/logger.h>
+#include <cpu/ppc_context.h>
 #include <kernel/memory.h>
 #include <api/SWA.h>
 #include <ui/game_window.h>
 #include <user/config.h>
 #include <app.h>
+#include "../archipelago_client.h"
 
 void DownForceDeltaTimeFixMidAsmHook(PPCRegister& f0)
 {
@@ -63,6 +66,13 @@ static double ComputeLerpFactor(double t, double deltaTime)
 // delta time, as it might be time scaled and not match with 30 FPS behavior.
 void CameraLerpFixMidAsmHook(PPCRegister& t)
 {
+    // AP DAY CAMERA TEST
+    static unsigned int apCameraCalls = 0;
+
+    if (++apCameraCalls % 300 == 0)
+    {
+        LOGFN("[AP DAY CAMERA TEST] Calls={}", apCameraCalls);
+    }
     t.f64 = ComputeLerpFactor(t.f64, App::s_deltaTime);
 }
 
@@ -135,6 +145,94 @@ void WaitVsyncMidAsmHook()
 
 void ApplicationFrameLimiterMidAsmHook()
 {
+    // AP TEST : nom du niveau actif
+    static unsigned int apStageCalls = 0;
+
+    if (++apStageCalls % 300 == 0)
+    {
+        auto* doc = SWA::CGameDocument::GetInstance();
+
+        if (doc && doc->m_pMember)
+        {
+            const char* stage = doc->m_pMember->m_StageName.c_str();
+
+            std::printf(
+                "[AP STAGE TEST] Stage=%s\n",
+                stage ? stage : "(null)"
+            );
+        }
+        else
+        {
+            std::printf("[AP STAGE TEST] Aucun GameDocument\n");
+        }
+    }
+    // AP LIFE : diagnostic de lecture en temps reel.
+    static unsigned int apLifeReadCalls = 0;
+
+    if (++apLifeReadCalls % 300 == 0)
+    {
+        auto* apDoc = SWA::CApplicationDocument::GetInstance();
+        auto* apParam = (apDoc && apDoc->m_pMember)
+            ? apDoc->m_pMember->m_spGameParameter.get()
+            : nullptr;
+        auto* apSave = apParam ? apParam->m_pSaveData.get() : nullptr;
+
+        if (apSave)
+        {
+            const auto* bytes =
+                reinterpret_cast<const uint8_t*>(apSave) + 0x8000;
+
+            const uint32_t lives =
+                (uint32_t(bytes[0]) << 24) |
+                (uint32_t(bytes[1]) << 16) |
+                (uint32_t(bytes[2]) << 8) |
+                 uint32_t(bytes[3]);
+
+            std::printf("[AP LIFE REALTIME TEST] lives=%u\n", lives);
+
+            // AP LIFE INSTANT : une vie par item Archipelago.
+            if (lives < 99 &&
+    APClient::GetPendingLifeBonus() > 0 &&
+    SWA::CGameDocument::GetInstance() &&
+    SWA::CGameDocument::GetInstance()->m_pMember &&
+    SWA::CGameDocument::GetInstance()->m_pMember->m_StageName.c_str() &&
+    SWA::CGameDocument::GetInstance()->m_pMember->m_StageName.c_str()[0] != '\0')
+            {
+                const uint32_t newLives = lives + 1;
+
+                auto* writableBytes =
+                    reinterpret_cast<uint8_t*>(apSave) + 0x8000;
+
+                writableBytes[0] = static_cast<uint8_t>(newLives >> 24);
+                writableBytes[1] = static_cast<uint8_t>(newLives >> 16);
+                writableBytes[2] = static_cast<uint8_t>(newLives >> 8);
+                writableBytes[3] = static_cast<uint8_t>(newLives);
+
+                std::printf("[AP LIFE INSTANT] %u -> %u\n", lives, newLives);
+                APClient::ConfirmLifeBonusApplied();
+            }
+        }
+    }
+    // AP LIFE CONTEXT TEST
+    static unsigned int apContextCalls = 0;
+    if (++apContextCalls % 300 == 0)
+    {
+        auto* ctx = GetPPCContext();
+        std::printf("[AP LIFE CONTEXT TEST] ctx=%p\n", static_cast<void*>(ctx));
+    }
+    // AP DEBUG : verifier si ce hook tourne dans les Acts et les hubs.
+    static auto lastReport = std::chrono::steady_clock::now();
+    static unsigned int callCount = 0;
+
+    ++callCount;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport >= std::chrono::seconds(5))
+    {
+        std::printf("[AP HOOK TEST] %u appels en 5 secondes\n", callCount);
+        callCount = 0;
+        lastReport = now;
+    }
 }
 
 // Tornado Defense boss increments timers without respecting delta time.
@@ -203,3 +301,8 @@ void CEvilSonicContext_CStateWall_LeaveRotationMidAsmHook(PPCRegister& f1)
     // delta time whilst maintaining the original behaviour at 30 FPS.
     f1.f64 = f1.f64 * (std::min(App::s_deltaTime, 1.0 / 15.0) / (1.0 / 30.0));
 }
+
+
+
+
+

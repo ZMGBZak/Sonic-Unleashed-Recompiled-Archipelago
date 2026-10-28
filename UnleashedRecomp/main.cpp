@@ -1,3 +1,4 @@
+#include "archipelago_client.h"
 #include <stdafx.h>
 #ifdef __x86_64__
 #include <cpuid.h>
@@ -342,6 +343,7 @@ int main(int argc, char *argv[])
     }
 
     ModLoader::Init();
+    // APClient::Start(); // Connexion manuelle depuis F8
 
     if (!PersistentStorageManager::LoadBinary())
         LOGFN_ERROR("Failed to load persistent storage binary... (status code {})", (int)PersistentStorageManager::BinStatus);

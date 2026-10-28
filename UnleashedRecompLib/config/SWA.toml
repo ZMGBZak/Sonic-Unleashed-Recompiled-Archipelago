@@ -1153,3 +1153,52 @@ registers = ["f1"]
 name = "CEvilSonicContext_CStateWall_LeaveRotationMidAsmHook"
 address = 0x82406774
 registers = ["f1"]
+
+# Archipelago - World Map Sun Medal Display
+[[midasm_hook]]
+name = "APWorldMapSunMedalHook"
+address = 0x8256B53C
+registers = ["r6"]
+
+# Archipelago - World Map Moon Medal Display
+[[midasm_hook]]
+name = "APWorldMapMoonMedalHook"
+address = 0x8256B5C8
+registers = ["r6"]
+
+# Archipelago - Hub Sun Medal Display
+[[midasm_hook]]
+name = "APHubSunMedalHook"
+address = 0x824E16F4
+registers = ["r5"]
+
+# Archipelago - Hub Moon Medal Display
+[[midasm_hook]]
+name = "APHubMoonMedalHook"
+address = 0x824E17C4
+registers = ["r5"]
+
+# Archipelago Hotdog diagnostic (temporary)
+[[midasm_hook]]
+name = "APHotdogDebugMidAsmHook"
+address = 0x824BBBB4
+registers = ["r27", "r28"]
+
+
+# Archipelago inventory diagnostic
+[[midasm_hook]]
+name = "APInventoryDebugMidAsmHook"
+address = 0x824BBFD0
+registers = ["r3", "r4", "r5"]
+
+
+# Archipelago menu inventory diagnostic
+[[midasm_hook]]
+name = "APMenuInventoryDebugMidAsmHook"
+address = 0x824BBAF8
+registers = ["r3", "r4"]
+
+# AP Sonic Day Death - diagnostic uniquement
+[[midasm_hook]]
+name = "AP_SonicDeathMidAsmHook"
+address = 0x823176DC

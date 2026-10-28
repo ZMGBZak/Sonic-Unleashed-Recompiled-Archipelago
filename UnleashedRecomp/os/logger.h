@@ -60,5 +60,9 @@ namespace os::logger
     };
 
     void Init();
+
+    // Export the complete session log to a bug report.
+    // Returns the report path, or an empty string on failure.
+    std::string ExportBugReport();
     void Log(const std::string_view str, ELogType type = ELogType::None, const char* func = nullptr);
 }

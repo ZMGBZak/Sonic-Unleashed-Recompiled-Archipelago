@@ -4,6 +4,7 @@
 #include <os/version.h>
 #include <patches/audio_patches.h>
 #include <api/SWA.h>
+#include <apu/custom_music.h>
 
 int AudioPatches::m_isAttenuationSupported = -1;
 
@@ -36,7 +37,19 @@ bool AudioPatches::CanAttenuate()
 
 void AudioPatches::Update(float deltaTime)
 {
-    auto pMusicVolume = GetVolume();
+        // BEGIN AP_CUSTOM_MUSIC_UPDATE
+    static bool customMusicInitialized = false;
+
+    if (!customMusicInitialized)
+    {
+        CustomMusic::Init();
+        customMusicInitialized = true;
+    }
+
+    CustomMusic::Update();
+    // END AP_CUSTOM_MUSIC_UPDATE
+
+auto pMusicVolume = GetVolume();
     auto pEffectsVolume = GetVolume(false);
 
     if (!pMusicVolume || !pEffectsVolume)
@@ -60,6 +73,15 @@ void AudioPatches::Update(float deltaTime)
         *pMusicVolume = Config::MusicVolume;
     }
 
+
+    // BEGIN AP_CUSTOM_MUSIC_MUTE
+    // Mute only original BGM while custom WAV is playing.
+    // Keep SFX and game volume settings unchanged.
+    if (CustomMusic::IsPlaying())
+    {
+        *pMusicVolume = 0.0f;
+    }
+    // END AP_CUSTOM_MUSIC_MUTE
     *pEffectsVolume = Config::EffectsVolume;
 }
 
@@ -93,3 +115,6 @@ bool MakeCueSheetDataMidAsmHook(PPCRegister& r31)
 
     return false;
 }
+
+
+

@@ -121,6 +121,7 @@ set(UNLEASHED_RECOMP_GPU_CXX_SOURCES
 set(UNLEASHED_RECOMP_APU_CXX_SOURCES
     "apu/audio.cpp"
     "apu/embedded_player.cpp"
+    "apu/custom_music.cpp"
     "apu/driver/sdl2_driver.cpp"
 )
 
@@ -130,6 +131,7 @@ set(UNLEASHED_RECOMP_HID_CXX_SOURCES
 )
 
 set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
+    "patches/SonicDayDebug.cpp"
     "patches/aspect_ratio_patches.cpp"
     "patches/audio_patches.cpp"
     "patches/camera_patches.cpp"
@@ -222,6 +224,7 @@ set_source_files_properties(${UNLEASHED_RECOMP_THIRDPARTY_SOURCES} PROPERTIES SK
 
 set(UNLEASHED_RECOMP_CXX_SOURCES
     "app.cpp"
+    "archipelago_client.cpp"
     "exports.cpp"
     "main.cpp"
     "misc_impl.cpp"
@@ -400,6 +403,7 @@ target_link_libraries(UnleashedRecomp PRIVATE
     UnleashedRecompLib
     xxHash::xxhash
     CURL::libcurl
+    winhttp
     plume
 )
 
@@ -566,3 +570,21 @@ BIN2C(TARGET_OBJ UnleashedRecomp SOURCE_FILE "${RESOURCES_SOURCE_PATH}/sounds/sy
 BIN2C(TARGET_OBJ UnleashedRecomp SOURCE_FILE "${RESOURCES_SOURCE_PATH}/sounds/sys_actstg_pausedecide.ogg" DEST_FILE "${RESOURCES_OUTPUT_PATH}/sounds/sys_actstg_pausedecide.ogg" ARRAY_NAME "g_sys_actstg_pausedecide")
 BIN2C(TARGET_OBJ UnleashedRecomp SOURCE_FILE "${RESOURCES_SOURCE_PATH}/sounds/sys_actstg_pausewinclose.ogg" DEST_FILE "${RESOURCES_OUTPUT_PATH}/sounds/sys_actstg_pausewinclose.ogg" ARRAY_NAME "g_sys_actstg_pausewinclose")
 BIN2C(TARGET_OBJ UnleashedRecomp SOURCE_FILE "${RESOURCES_SOURCE_PATH}/sounds/sys_actstg_pausewinopen.ogg" DEST_FILE "${RESOURCES_OUTPUT_PATH}/sounds/sys_actstg_pausewinopen.ogg" ARRAY_NAME "g_sys_actstg_pausewinopen")
+
+
+
+
+if(WIN32)
+    find_package(PNG REQUIRED)
+    target_link_libraries(UnleashedRecomp PRIVATE PNG::PNG)
+endif()
+
+# AP_FREETYPE_EXTRA_LIBS
+target_link_libraries(UnleashedRecomp PRIVATE
+    optimized "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows-static/lib/brotlidec.lib"
+    optimized "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows-static/lib/brotlicommon.lib"
+    optimized "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows-static/lib/bz2.lib"
+    debug "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows-static/debug/lib/brotlidec.lib"
+    debug "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows-static/debug/lib/brotlicommon.lib"
+    debug "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows-static/debug/lib/bz2d.lib"
+)

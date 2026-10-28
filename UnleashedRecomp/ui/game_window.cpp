@@ -16,6 +16,9 @@
 #include <res/images/game_icon_night.bmp.h>
 
 bool m_isFullscreenKeyReleased = true;
+
+// AP Connector : visibilite du menu Archipelago.
+bool g_apConnectorVisible = false;
 bool m_isResizing = false;
 
 int Window_OnSDLEvent(void*, SDL_Event* event)
@@ -70,6 +73,18 @@ int Window_OnSDLEvent(void*, SDL_Event* event)
                     break;
                 }
 
+                // AP Connector : afficher ou masquer le menu avec F8.
+                case SDLK_F8:
+                    if (event->key.repeat == 0)
+                    {
+                        g_apConnectorVisible = !g_apConnectorVisible;
+                        SDL_ShowCursor(
+                            g_apConnectorVisible || !GameWindow::IsFullscreen()
+                                ? SDL_ENABLE
+                                : (GameWindow::s_isFullscreenCursorVisible ? SDL_ENABLE : SDL_DISABLE)
+                        );
+                    }
+                    break;
                 // Restore original window dimensions on F2.
                 case SDLK_F2:
                     Config::Fullscreen = GameWindow::SetFullscreen(false);

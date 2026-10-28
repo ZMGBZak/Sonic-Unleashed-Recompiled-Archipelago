@@ -1,4 +1,6 @@
 #include <api/SWA.h>
+#include <archipelago_client.h>
+#include <os/logger.h>
 #include <ui/game_window.h>
 #include <user/achievement_manager.h>
 #include <user/persistent_storage_manager.h>
@@ -193,3 +195,82 @@ PPC_FUNC(sub_824EE620)
 
     ctx.r3.u32 = PersistentStorageManager::ShouldDisplayDLCMessage(true);
 }
+
+
+
+
+
+// Archipelago Hotdog diagnostic (temporary)
+void APHotdogDebugMidAsmHook(PPCRegister& r27, PPCRegister& r28)
+{
+    static unsigned int logCount = 0;
+
+    if (logCount++ >= 100)
+        return;
+
+    printf("[AP HOTDOG DEBUG] ID=%u | Quantity=%u\n",
+        r27.u32, r28.u32);
+}
+
+
+void APInventoryDebugMidAsmHook(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5)
+{
+    printf("[AP INVENTORY DEBUG] Progress=0x%08X | ID=%u | Delta=%d\n",
+        r3.u32, r4.u32, r5.s32);
+}
+
+void APMenuInventoryDebugMidAsmHook(PPCRegister& r3, PPCRegister& r4)
+{
+    if (r3.u32 == 0 || r4.u32 != 0)
+        return;
+
+    // Distribuer tous les consommables AP disponibles.
+    // Limite de securite pour eviter une boucle infinie.
+    for (unsigned int attempt = 0; attempt < 1000; ++attempt)
+    {
+        const std::uint32_t itemId = APClient::GetPendingConsumable();
+
+        if (itemId == 0)
+            break;
+
+        const std::uint32_t before =
+            GuestToHostFunction<std::uint32_t>(
+                sub_82519C38, r3.u32, itemId
+            );
+
+        if (before >= 99)
+        {
+            printf("[AP CONSUMABLE] Inventory full: item=%u quantity=%u\n",
+                itemId, before);
+            APClient::CancelConsumable();
+            break;
+        }
+
+        GuestToHostFunction<void>(
+            sub_8251B810, r3.u32, itemId, 1
+        );
+
+        const std::uint32_t after =
+            GuestToHostFunction<std::uint32_t>(
+                sub_82519C38, r3.u32, itemId
+            );
+
+        if (after <= before)
+        {
+            printf("[AP CONSUMABLE] Grant failed: item=%u before=%u after=%u\n",
+                itemId, before, after);
+            APClient::CancelConsumable();
+            break;
+        }
+
+        APClient::ConfirmConsumableApplied();
+
+        printf("[AP CONSUMABLE] Granted item=%u quantity=%u -> %u\n",
+            itemId, before, after);
+    }
+}
+
+
+
+
+
