@@ -48,3 +48,44 @@ releases/
 *.key
 *.pem
 config.local.*
+
+# Backups, temporary patches, and local recovery copies
+*.bak
+*.bak.*
+*.backup
+*.backup.*
+*.old
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+*.tmp.*
+*.temp
+*.temp.*
+*.autosave
+*.autosave.*
+*.backup-*
+*_backup/
+*_backups/
+backup/
+backups/
+Backups/
+Backup/
+**/backup/
+**/backups/
+**/Backups/
+**/Backup/
+
+# Local Archipelago progress/saves and user settings
+archipelago_checks_*.json
+archipelago_rings_*.json
+archipelago_lives_*.json
+archipelago_*_*.json
+*.archipelago
+logs/
+crashdumps/
+
+# Private working installers and diagnostics
+AP_*_Diagnostic*.ps1
+AP_*_Backup*
