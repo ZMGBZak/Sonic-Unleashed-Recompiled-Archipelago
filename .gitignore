@@ -1,0 +1,50 @@
+# Build and IDE
+out/
+build/
+cmake-build-*/
+.vs/
+.vscode/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.log
+*.dmp
+*.tmp
+
+# Local game data and extracted content
+game/
+game-data/
+game_data/
+extracted/
+dumps/
+roms/
+isos/
+*.iso
+*.xex
+*.wad
+*.pak
+*.arc
+*.cpk
+*.afs
+*.xma
+*.wem
+*.bnk
+*.usm
+
+# Local distributions: review manually before making any release
+dist/
+releases/
+*.exe
+*.dll
+*.zip
+*.7z
+*.rar
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+config.local.*
