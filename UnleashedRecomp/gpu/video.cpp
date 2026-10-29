@@ -1391,8 +1391,8 @@ extern ImFontBuilderIO g_fontBuilderIO;
 #ifdef _WIN32
 namespace APUpdateV1
 {
-    constexpr const char* kClientVersion = "0.0.0";
-    constexpr const char* kAPWorldVersion = "0.0.0";
+    constexpr const char* kClientVersion = "0.8.0";
+    constexpr const char* kAPWorldVersion = "0.8.0";
     constexpr const char* kReleasePage = "https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases";
     static std::atomic<int> status{0}; // 0 idle, 1 checking, 2 complete, 3 error
     static std::mutex resultMutex;
@@ -1500,6 +1500,8 @@ namespace APUpdateV1
     }
     static void DrawControls()
     {
+        ImGui::Text("Installed Client Version: %s Beta", kClientVersion);
+        ImGui::Separator();
         ImGui::BeginDisabled(status.load() == 1);
         if (ImGui::Button("CHECK FOR UPDATES", ImVec2(-1, 40))) StartCheck();
         // AP_F8_USABILITY_V4: chrome / glossy look matching other menu buttons.
