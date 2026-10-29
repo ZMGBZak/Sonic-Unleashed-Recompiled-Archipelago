@@ -49,9 +49,13 @@
 #include <ui/game_window.h>
 #include <ui/black_bar.h>
 #include <patches/aspect_ratio_patches.h>
+#include <patches/ap_medal_radar.h> // AP_MEDAL_RADAR_AUDIO_V1
 #include <user/config.h>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
+#include <chrono>
+#include <limits>
 #include "../archipelago_client.h"
 namespace APClient { int GetMedalGoalCount(); }
 #include <sdl_listener.h>
@@ -2826,6 +2830,176 @@ static void DrawFPS()
     drawList->AddText(font, fontSize, textPos, IM_COL32_WHITE, fmt.c_str());
 }
 
+// AP_MEDAL_RADAR_AUDIO_V1_BEGIN
+// SDL queue audio is confined to the ImGui/video thread. CustomMusic and
+// the game's audio/mixer channels are not touched by this feature.
+namespace APMedalRadarAudio
+{
+    static constexpr float kDetectionRadius = 50.0f;
+    static constexpr int kFrequency = 44100;
+    static constexpr int kChannels = 2;
+    static constexpr int kBeepDurationMs = 70;
+    static constexpr float kPi = 3.14159265358979323846f;
+    static bool enabled = false;   // OFF on first launch
+    static int volume = 35;       // percent; separate from game/music volume
+    static bool loaded = false;
+    static SDL_AudioDeviceID device = 0;
+    static std::chrono::steady_clock::time_point lastBeep{};
+    static unsigned beepCount = 0;
+    static bool deviceErrorLogged = false;
+
+    static std::filesystem::path SettingsPath()
+    {
+        // Always use the same user config directory as Unleashed Recompiled.
+        return Config::GetConfigPath().parent_path() / "archipelago_medal_radar.json";
+    }
+
+    static void Load()
+    {
+        if (loaded) return;
+        loaded = true;
+        try
+        {
+            std::ifstream stream(SettingsPath());
+            if (!stream) return;
+            const auto data = nlohmann::json::parse(stream, nullptr, false);
+            if (!data.is_object()) return;
+            if (data.contains("enabled") && data["enabled"].is_boolean())
+                enabled = data["enabled"].get<bool>();
+            if (data.contains("volume") && data["volume"].is_number_integer())
+                volume = std::clamp(data["volume"].get<int>(), 0, 100);
+        }
+        catch (...)
+        {
+            // Damaged/missing preference files should never stop gameplay.
+            enabled = false;
+            volume = 35;
+        }
+    }
+
+    static void Save()
+    {
+        try
+        {
+            const auto path = SettingsPath();
+            std::filesystem::create_directories(path.parent_path());
+            const auto tmp = path.string() + ".tmp";
+            {
+                std::ofstream stream(tmp, std::ios::trunc);
+                if (!stream) return;
+                stream << nlohmann::json({{"enabled", enabled}, {"volume", volume}}).dump(2) << '\n';
+                stream.flush();
+                if (!stream) return;
+            }
+            // Rename may not replace the target on Windows. Remove the prior
+            // small preferences file only after the new one is flushed.
+            std::error_code ec;
+            std::filesystem::rename(tmp, path, ec);
+            if (ec)
+            {
+                ec.clear();
+                std::filesystem::remove(path, ec);
+                ec.clear();
+                std::filesystem::rename(tmp, path, ec);
+            }
+        }
+        catch (...) { /* non-critical settings write */ }
+    }
+
+    static void StopAudio()
+    {
+        if (device)
+        {
+            SDL_ClearQueuedAudio(device);
+            SDL_CloseAudioDevice(device);
+            device = 0;
+        }
+        lastBeep = {};
+    }
+
+    static bool StartDevice()
+    {
+        if (device) return true;
+        if (deviceErrorLogged) return false;
+        SDL_AudioSpec desired{};
+        desired.freq = kFrequency;
+        desired.format = AUDIO_F32SYS;
+        desired.channels = kChannels;
+        desired.samples = 1024;
+        desired.callback = nullptr; // SDL_QueueAudio (push mode)
+        device = SDL_OpenAudioDevice(nullptr, 0, &desired, nullptr, 0);
+        if (!device)
+        {
+            // A single diagnostic in the normal bug report, not every frame.
+            deviceErrorLogged = true;
+            LOGFN("AP MEDAL RADAR AUDIO: SDL_OpenAudioDevice failed: {}", SDL_GetError());
+            return false;
+        }
+        SDL_PauseAudioDevice(device, 0);
+        LOGN("AP MEDAL RADAR AUDIO: device ready (44.1kHz stereo float)");
+        return true;
+    }
+
+    static void QueueBeep(float distance)
+    {
+        if (!StartDevice()) return;
+        // Audible, brief sine pulse with fade-in/out to avoid clicks.
+        // Faster and slightly higher pitched when nearer the medal.
+        const float proximity = 1.0f - std::clamp(distance / kDetectionRadius, 0.0f, 1.0f);
+        const float pitch = 740.0f + 240.0f * proximity;
+        const float amplitude = 0.20f * (static_cast<float>(volume) / 100.0f);
+        constexpr int frames = kFrequency * kBeepDurationMs / 1000;
+        std::vector<float> samples(static_cast<size_t>(frames) * kChannels);
+        for (int i = 0; i < frames; ++i)
+        {
+            const float t = static_cast<float>(i) / kFrequency;
+            const float attack = std::min(1.0f, t / 0.004f);
+            const float release = std::min(1.0f, (frames - 1 - i) / (kFrequency * 0.014f));
+            const float env = std::min(attack, release);
+            const float wave = amplitude * env * std::sin(2.0f * kPi * pitch * t);
+            samples[static_cast<size_t>(i) * 2] = wave;
+            samples[static_cast<size_t>(i) * 2 + 1] = wave;
+        }
+        // Limit output buffering: audio must stop quickly on stage changes.
+        if (SDL_GetQueuedAudioSize(device) > static_cast<Uint32>(kFrequency * kChannels * sizeof(float) / 5))
+            return;
+        if (SDL_QueueAudio(device, samples.data(), static_cast<Uint32>(samples.size() * sizeof(float))) == 0)
+        {
+            if (++beepCount <= 3 || beepCount % 50 == 0)
+                LOGFN("AP MEDAL RADAR AUDIO: beep #{} distance={:.2f} volume={}%", beepCount, distance, volume);
+        }
+    }
+
+    static void Tick()
+    {
+        Load();
+        if (!enabled || volume <= 0)
+        {
+            if (device) StopAudio();
+            return;
+        }
+        float distance = -1.0f;
+        if (!APMedalRadarBridge::GetFreshDistance(distance) || distance > kDetectionRadius)
+        {
+            // Clear previously queued sound immediately when no medal exists.
+            if (device && SDL_GetQueuedAudioSize(device) != 0)
+                SDL_ClearQueuedAudio(device);
+            lastBeep = {};
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const float farFactor = std::clamp(distance / kDetectionRadius, 0.0f, 1.0f);
+        const float intervalSeconds = 0.12f + 0.85f * std::sqrt(farFactor);
+        if (lastBeep.time_since_epoch().count() != 0 &&
+            std::chrono::duration<float>(now - lastBeep).count() < intervalSeconds)
+            return;
+        if (!StartDevice()) return;
+        lastBeep = now;
+        QueueBeep(distance);
+    }
+}
+// AP_MEDAL_RADAR_AUDIO_V1_END
+
 static void DrawImGui()
 {
     ImGui_ImplSDL2_NewFrame();
@@ -3858,6 +4032,32 @@ static void DrawImGui()
 
             ImGui::Spacing();
 
+            // AP_MEDAL_RADAR_F8_V1_BEGIN
+            // Simple controls in the F8 main menu (not the APWorld).
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.40f, 0.82f, 1.0f, 1.0f), "MEDAL RADAR");
+            APMedalRadarAudio::Load();
+            bool apRadarEnabled = APMedalRadarAudio::enabled;
+            if (ImGui::Checkbox("Enable Medal Radar##APRadarEnabled", &apRadarEnabled))
+            {
+                APMedalRadarAudio::enabled = apRadarEnabled;
+                if (!apRadarEnabled) APMedalRadarAudio::StopAudio();
+                APMedalRadarAudio::Save();
+            }
+            int apRadarVolume = APMedalRadarAudio::volume;
+            if (ImGui::SliderInt("Radar Volume##APRadarVolume", &apRadarVolume, 0, 100, "%d%%"))
+                APMedalRadarAudio::volume = apRadarVolume;
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                APMedalRadarAudio::Save();
+            float apRadarDistance = 0.0f;
+            if (APMedalRadarBridge::GetFreshDistance(apRadarDistance))
+                ImGui::TextDisabled("Nearest uncollected medal: %.1f units", apRadarDistance);
+            else
+                ImGui::TextDisabled("No uncollected medal currently tracked");
+            ImGui::TextDisabled("Beeps speed up within 50 units. OFF by default.");
+            ImGui::Spacing();
+            // AP_MEDAL_RADAR_F8_V1_END
+
             // Ouvrir le sous-menu Custom Music.
             if (apCustomMusicVisible)
             {
@@ -4669,6 +4869,7 @@ if (ImGui::BeginTabItem("BOSSES"))
 
     assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
 
+    APMedalRadarAudio::Tick(); // AP_MEDAL_RADAR_AUDIO_V1
     DrawAPMedalsHud();
     DrawFPS();
     DrawProfiler();

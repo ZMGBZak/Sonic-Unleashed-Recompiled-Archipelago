@@ -40,14 +40,8 @@ std::filesystem::path ModLoader::ResolvePath(std::string_view path)
 
     if (root == "save")
     {
-        if (!ModLoader::s_saveFilePath.empty())
-        {
-            if (path == "SYS-DATA")
-                return ModLoader::s_saveFilePath;
-            else
-                return ModLoader::s_saveFilePath.parent_path() / path;
-        }
-
+        // Archipelago saves are isolated through the XAM save root.
+        // Never redirect save files to a mod-defined Vanilla location.
         return {};
     }
 

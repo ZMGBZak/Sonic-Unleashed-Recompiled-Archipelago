@@ -82,15 +82,10 @@ void KiSystemStartup()
 
     if (!saveFileExists)
     {
-        // Copy base save data to modded save as fallback.
+        // Archipelago: create an isolated save directory.
+        // Never import an existing Vanilla save.
         std::error_code ec;
         std::filesystem::create_directories(saveFilePath.parent_path(), ec);
-
-        if (!ec)
-        {
-            std::filesystem::copy_file(GetSaveFilePath(false), saveFilePath, ec);
-            saveFileExists = !ec;
-        }
     }
 
     if (saveFileExists)

@@ -5,6 +5,7 @@
 #include "ap_stage_registry.h"
 #include <chrono>
 #include <cstring>
+#include <cmath> // AP_MEDAL_RADAR_DIAG_V1: validate transform coordinates
 #include <curl/curl.h>
 #include <string>
 #include <unordered_set>
@@ -21,6 +22,7 @@
 #include <kernel/function.h>
 #include <ppc/ppc_recomp_shared.h>
 #include "aspect_ratio_patches.h"
+#include "ap_medal_radar.h" // AP_MEDAL_RADAR_AUDIO_V1
 #include "camera_patches.h"
 #include "inspire_patches.h"
 
@@ -2670,6 +2672,271 @@ else
     __imp__sub_8268AC88(ctx, base);
 }
 
+// AP_MEDAL_RADAR_DIAG_V1_BEGIN
+// Read-only transform inspection. These offsets come from the recompiled
+// sub_82515C40 -> sub_825902D0 -> sub_825904A0 transform-component path.
+// The second vector is a world-matrix translation CANDIDATE until in-game
+// measurements confirm its coordinate space. No Archipelago checks are changed.
+static float AP_MedalRadarReadFloat(uint8_t* base, uint32_t guestAddress)
+{
+    const uint32_t bits = PPC_LOAD_U32(guestAddress);
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static void AP_MedalRadarLogTransform(uint8_t* base, uint32_t object,
+    const std::string& medalID)
+{
+    // Called after the original initialization routine completed.
+    // The medal's base component is created in sub_82515C40.
+    const uint32_t component = PPC_LOAD_U32(object + 196);
+    if (component == 0)
+    {
+        LOGFN("AP MEDAL RADAR: {} status=NO_TRANSFORM_COMPONENT", medalID);
+        return;
+    }
+
+    // +112: local-position vector (XYZ).
+    const float lx = AP_MedalRadarReadFloat(base, component + 112);
+    const float ly = AP_MedalRadarReadFloat(base, component + 116);
+    const float lz = AP_MedalRadarReadFloat(base, component + 120);
+
+    // +192: second 4x4 transform matrix. Its final column starts at +240.
+    // Its world-space interpretation remains to be verified in-game.
+    const float wx = AP_MedalRadarReadFloat(base, component + 240);
+    const float wy = AP_MedalRadarReadFloat(base, component + 244);
+    const float wz = AP_MedalRadarReadFloat(base, component + 248);
+    if (!std::isfinite(lx) || !std::isfinite(ly) || !std::isfinite(lz) ||
+        !std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz))
+    {
+        LOGFN("AP MEDAL RADAR: {} status=INVALID_POSITION component=0x{:08X}",
+            medalID, component);
+        return;
+    }
+
+    // One record per unique stage/type/index, not once per frame.
+    // os::logger::ExportBugReport() (F8) includes normal LOGFN diagnostics.
+    LOGFN("AP MEDAL RADAR: {} component=0x{:08X} local=({:.3f},{:.3f},{:.3f}) matrixTranslation=({:.3f},{:.3f},{:.3f})",
+        medalID, component, lx, ly, lz, wx, wy, wz);
+}
+// AP_MEDAL_RADAR_DIAG_V1_END
+
+
+// AP_MEDAL_RADAR_AUDIO_V1_BEGIN
+// World positions for both Sonic forms and medals were confirmed in V3 logs.
+// Publish only the closest uncollected medal distance to the SDL/UI thread.
+// This code never plays audio, changes AP checks, or modifies the game save.
+//
+// Generated PPC evidence (from the user's ppc(4).zip):
+//   sub_823082F8: context+0x10 -> sub_825904A0 (writes vector at +0x70)
+//   sub_82308300: context+0x10 -> sub_825904E8 (writes rotation at +0x60)
+//   sub_82308308: context+0x10 -> sub_82489960 (reads rotation at +0x60)
+// Validated in-game 2026-10-29: Day and Werehog positions track movement.
+struct AP_MedalRadarV3Position
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+static std::string apMedalRadarV3Stage;
+static std::unordered_map<std::string, AP_MedalRadarV3Position> apMedalRadarV3Medals;
+static uint32_t apMedalRadarV3PlayerObject = 0;
+static uint32_t apMedalRadarV3Samples = 0;
+static bool apMedalRadarV3HasPreviousPosition = false;
+static AP_MedalRadarV3Position apMedalRadarV3PreviousPosition;
+static std::chrono::steady_clock::time_point apMedalRadarV3LastSample{};
+static std::chrono::steady_clock::time_point apMedalRadarV3LastRealtimeSample{};
+
+static bool AP_MedalRadarV3GuestPointer(uint32_t address)
+{
+    return address >= 0x10000 && address < 0x40000000;
+}
+
+static bool AP_MedalRadarV3Valid(const AP_MedalRadarV3Position& p)
+{
+    return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+        std::fabs(p.x) < 1000000.0f && std::fabs(p.y) < 1000000.0f &&
+        std::fabs(p.z) < 1000000.0f;
+}
+
+static AP_MedalRadarV3Position AP_MedalRadarV3ReadXYZ(uint8_t* base, uint32_t address)
+{
+    return {
+        AP_MedalRadarReadFloat(base, address),
+        AP_MedalRadarReadFloat(base, address + 4),
+        AP_MedalRadarReadFloat(base, address + 8)
+    };
+}
+
+static void AP_MedalRadarV3SetStage(const std::string& stage)
+{
+    if (stage == apMedalRadarV3Stage)
+        return;
+
+    apMedalRadarV3Stage = stage;
+    apMedalRadarV3Medals.clear();
+    apMedalRadarV3PlayerObject = 0;
+    apMedalRadarV3Samples = 0;
+    apMedalRadarV3HasPreviousPosition = false;
+    apMedalRadarV3LastSample = {};
+    apMedalRadarV3LastRealtimeSample = {};
+    APMedalRadarBridge::Clear();
+}
+
+static void AP_MedalRadarV3RememberMedal(uint8_t* base,
+    uint32_t object, const std::string& stage, const std::string& medalID)
+{
+    AP_MedalRadarV3SetStage(stage);
+    if (!AP_MedalRadarV3GuestPointer(object))
+        return;
+
+    const uint32_t component = PPC_LOAD_U32(object + 196);
+    if (!AP_MedalRadarV3GuestPointer(component))
+        return;
+
+    // Only store a snapshot: medal objects can be destroyed on pickup.
+    const auto medal = AP_MedalRadarV3ReadXYZ(base, component + 240);
+    if (AP_MedalRadarV3Valid(medal))
+        apMedalRadarV3Medals[medalID] = medal;
+}
+
+static void AP_MedalRadarV3PlayerSample(uint8_t* base,
+    uint32_t playerObject, const char* character)
+{
+    if (!AP_MedalRadarV3GuestPointer(playerObject))
+    {
+        APMedalRadarBridge::Clear();
+        return;
+    }
+
+    const auto* doc = SWA::CGameDocument::GetInstance();
+    if (!doc || !doc->m_pMember)
+    {
+        APMedalRadarBridge::Clear();
+        return;
+    }
+
+    const std::string stage = doc->m_pMember->m_StageName.c_str();
+    if (stage.empty())
+    {
+        APMedalRadarBridge::Clear();
+        return;
+    }
+
+    AP_MedalRadarV3SetStage(stage);
+    if (apMedalRadarV3PlayerObject != playerObject)
+    {
+        apMedalRadarV3PlayerObject = playerObject;
+        apMedalRadarV3Samples = 0;
+        apMedalRadarV3HasPreviousPosition = false;
+        apMedalRadarV3LastSample = {};
+        apMedalRadarV3LastRealtimeSample = {};
+        APMedalRadarBridge::Clear();
+    }
+
+    // The sound needs ~50 ms precision; retain the original one-second
+    // diagnostics independently so the F8 bug report stays readable.
+    const auto now = std::chrono::steady_clock::now();
+    if (apMedalRadarV3LastRealtimeSample.time_since_epoch().count() != 0 &&
+        now - apMedalRadarV3LastRealtimeSample < std::chrono::milliseconds(50))
+        return;
+    apMedalRadarV3LastRealtimeSample = now;
+
+    const bool shouldLog = apMedalRadarV3Samples < 40 &&
+        (apMedalRadarV3LastSample.time_since_epoch().count() == 0 ||
+         now - apMedalRadarV3LastSample >= std::chrono::seconds(1));
+    if (shouldLog)
+    {
+        apMedalRadarV3LastSample = now;
+        ++apMedalRadarV3Samples;
+    }
+
+    const uint32_t context = PPC_LOAD_U32(playerObject + 196);
+    if (!AP_MedalRadarV3GuestPointer(context))
+    {
+        APMedalRadarBridge::Clear();
+        if (shouldLog) LOGFN("AP MEDAL RADAR V3: character={} stage={} status=NO_CONTEXT player=0x{:08X} context=0x{:08X}",
+            character, stage, playerObject, context);
+        return;
+    }
+
+    const uint32_t state = PPC_LOAD_U32(context + 0x10);
+    if (!AP_MedalRadarV3GuestPointer(state))
+    {
+        APMedalRadarBridge::Clear();
+        if (shouldLog) LOGFN("AP MEDAL RADAR V3: character={} stage={} status=NO_STATE player=0x{:08X} context=0x{:08X} state=0x{:08X}",
+            character, stage, playerObject, context, state);
+        return;
+    }
+
+    // Position (written by sub_825904A0) and orientation (read by
+    // sub_82308308) are in the SAME live movement-state object.
+    const auto position = AP_MedalRadarV3ReadXYZ(base, state + 0x70);
+    const float qw = AP_MedalRadarReadFloat(base, state + 0x60);
+    const float qx = AP_MedalRadarReadFloat(base, state + 0x64);
+    const float qy = AP_MedalRadarReadFloat(base, state + 0x68);
+    const float qz = AP_MedalRadarReadFloat(base, state + 0x6C);
+    const double qLenSquared = double(qw) * qw + double(qx) * qx +
+        double(qy) * qy + double(qz) * qz;
+
+    if (!AP_MedalRadarV3Valid(position))
+    {
+        APMedalRadarBridge::Clear();
+        if (shouldLog) LOGFN("AP MEDAL RADAR V3: character={} stage={} status=INVALID_POSITION state=0x{:08X} xyz=({:.3f},{:.3f},{:.3f})",
+            character, stage, state, position.x, position.y, position.z);
+        return;
+    }
+
+    double moved = 0.0;
+    if (apMedalRadarV3HasPreviousPosition)
+    {
+        const double dx = double(position.x) - apMedalRadarV3PreviousPosition.x;
+        const double dy = double(position.y) - apMedalRadarV3PreviousPosition.y;
+        const double dz = double(position.z) - apMedalRadarV3PreviousPosition.z;
+        moved = std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    apMedalRadarV3PreviousPosition = position;
+    apMedalRadarV3HasPreviousPosition = true;
+
+    double nearestSquared = 1.0e30;
+    std::string nearestID;
+    size_t remaining = 0;
+    for (const auto& [medalID, medal] : apMedalRadarV3Medals)
+    {
+        // Read-only: consult the AP pickup cache but never modify it.
+        if (apCollectedMedals.find(medalID) != apCollectedMedals.end())
+            continue;
+        ++remaining;
+        const double dx = double(position.x) - medal.x;
+        const double dy = double(position.y) - medal.y;
+        const double dz = double(position.z) - medal.z;
+        const double distanceSquared = dx * dx + dy * dy + dz * dz;
+        if (distanceSquared < nearestSquared)
+        {
+            nearestSquared = distanceSquared;
+            nearestID = medalID;
+        }
+    }
+
+    if (nearestID.empty())
+    {
+        APMedalRadarBridge::Clear();
+        if (shouldLog) LOGFN("AP MEDAL RADAR V3: character={} stage={} state=0x{:08X} playerXYZ=({:.3f},{:.3f},{:.3f}) moved={:.3f} qLenSq={:.3f} remaining=0 status=NO_TRACKED_MEDAL",
+            character, stage, state, position.x, position.y, position.z,
+            moved, qLenSquared);
+        return;
+    }
+
+    const float distance = static_cast<float>(std::sqrt(nearestSquared));
+    APMedalRadarBridge::Publish(distance);
+    if (shouldLog) LOGFN("AP MEDAL RADAR V3: character={} stage={} state=0x{:08X} playerXYZ=({:.3f},{:.3f},{:.3f}) moved={:.3f} qLenSq={:.3f} nearest={} distance={:.2f} remaining={}",
+        character, stage, state, position.x, position.y, position.z,
+        moved, qLenSquared, nearestID, distance, remaining);
+}
+// AP_MEDAL_RADAR_AUDIO_V1_END
+
 // AP TEST - Detect medals before pickup
 static std::unordered_set<std::string> apDetectedMedals;
 
@@ -2733,7 +3000,11 @@ LOGFN("AP MEDAL DEBUG: object={} type={} index={} r4={} r5={} r6={}",
     if (apDetectedMedals.insert(medalID).second)
     {
         LOGFN("AP MEDAL DETECTED: {}", medalID);
+        AP_MedalRadarLogTransform(base, object, medalID); // AP_MEDAL_RADAR_DIAG_V1
     }
+    // Track even on a stage reload when the old one-time detection log
+    // has already been emitted for this medal ID.
+    AP_MedalRadarV3RememberMedal(base, object, stage, medalID);
 }
 
 // AP TEST - Medal constructor
@@ -2967,6 +3238,8 @@ PPC_FUNC(sub_823C6400)
 
     // Executer normalement la mise a jour du jeu.
     __imp__sub_823C6400(ctx, base);
+    // AP_MEDAL_RADAR_DIAG_V3: movement-state player XYZ, read only.
+    AP_MedalRadarV3PlayerSample(base, apWerehogObject, "Werehog");
 
     const auto* apDoc = SWA::CGameDocument::GetInstance();
 
@@ -3638,6 +3911,8 @@ PPC_FUNC(sub_82310F20)
     // BEGIN AP_FREEZE_TRACE upd-leave
     AP_FreezeTraceUpdateLeave(ctx, base);
     // END AP_FREEZE_TRACE upd-leave
+    // AP_MEDAL_RADAR_DIAG_V3: supports Sonic Day and Werehog.
+    AP_MedalRadarV3PlayerSample(base, sonicObject, "SonicDay");
 }
 
 // AP WEREHOG DEATH LINK - DIAGNOSTIC

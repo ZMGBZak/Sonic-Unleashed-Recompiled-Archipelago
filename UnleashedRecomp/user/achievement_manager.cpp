@@ -115,11 +115,8 @@ bool AchievementManager::LoadBinary()
 
     if (!std::filesystem::exists(dataPath))
     {
-        // Try loading base achievement data as fallback.
-        dataPath = GetDataPath(false);
-
-        if (!std::filesystem::exists(dataPath))
-            return true;
+        // Archipelago: never load Vanilla achievement data.
+        return true;
     }
 
     std::error_code ec;

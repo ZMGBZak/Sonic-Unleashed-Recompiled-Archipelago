@@ -32,6 +32,69 @@ int apSelectedGoal = -1; // 0 Dark Gaia, 1 Egg Dragoon, 2 medals
 bool apGoalPending = false;
 bool apGoalSent = false;
 // AP_GOAL_V1_END
+// AP_DLC_FILTER_BEGIN - protected by apMutex.
+// Default ON for backward compatibility with older APWorlds.
+bool apIncludeDlc = true;
+// AP_RANK_THRESHOLD_BEGIN - protected by apMutex.
+// 0=D, 1=C, 2=B, 3=A. Default A preserves old behavior.
+int apRequiredRankForAllChecks = 3;
+
+// Stable Rank D location IDs; every group is D,C,B,A (four consecutive IDs).
+constexpr std::int64_t kRankGroupBases[] = {
+    88000372LL, 88000377LL, 88000382LL, 88000387LL, 88000392LL, 88000397LL,
+    88000402LL, 88000407LL, 88000412LL, 88000417LL, 88000422LL, 88000432LL,
+    88000437LL, 88000442LL, 88000447LL, 88000452LL, 88000457LL, 88000462LL,
+    88000467LL, 88000472LL, 88000477LL, 88000482LL, 88000487LL, 88000492LL,
+    88000497LL, 88000502LL, 88000507LL, 88000512LL, 88000517LL, 88000522LL,
+    88000527LL, 88000532LL, 88000537LL, 88000542LL, 88000547LL, 88000552LL,
+    88000557LL, 88000562LL, 88000567LL, 88000572LL, 88000577LL, 88000582LL,
+    88000587LL, 88000592LL, 88000597LL, 88000602LL, 88000607LL, 88000612LL,
+    88000617LL, 88000622LL, 88000627LL, 88000632LL, 88000637LL, 88000642LL,
+    88000647LL, 88000652LL, 88000657LL, 88000662LL, 88000667LL,
+ };
+
+bool GetRankLocationGroup(std::int64_t id, std::int64_t& base, int& rankIndex)
+{
+    for (const auto candidate : kRankGroupBases)
+    {
+        if (id >= candidate && id < candidate + 4)
+        {
+            base = candidate;
+            rankIndex = static_cast<int>(id - candidate);
+            return true;
+        }
+    }
+    return false;
+}
+// AP_RANK_THRESHOLD_END
+
+
+bool IsDlcLocation(std::int64_t id)
+{
+    return
+        (id >= 88000386LL && id <= 88000395LL) ||
+        (id >= 88000441LL && id <= 88000445LL) ||
+        (id >= 88000451LL && id <= 88000455LL) ||
+        (id >= 88000461LL && id <= 88000470LL) ||
+        (id >= 88000476LL && id <= 88000480LL) ||
+        (id >= 88000486LL && id <= 88000490LL) ||
+        (id >= 88000501LL && id <= 88000505LL) ||
+        (id >= 88000511LL && id <= 88000525LL) ||
+        (id >= 88000531LL && id <= 88000540LL) ||
+        (id >= 88000551LL && id <= 88000560LL) ||
+        (id >= 88000566LL && id <= 88000575LL) ||
+        (id >= 88000581LL && id <= 88000590LL) ||
+        (id >= 88000596LL && id <= 88000605LL) ||
+        (id >= 88000616LL && id <= 88000630LL) ||
+        (id >= 88000641LL && id <= 88000645LL) ||
+        (id >= 88000651LL && id <= 88000655LL);
+}
+
+bool IsLocationAllowed(std::int64_t id)
+{
+    return apIncludeDlc || !IsDlcLocation(id);
+}
+// AP_DLC_FILTER_END
 
     // Nombre de morts locales attendant un envoi Death Link.
     std::uint32_t apPendingDeathLinks = 0;
@@ -2619,7 +2682,8 @@ bool apSuperClawsStateLoadedSuccessfully = false;
 
                     for (auto id : apPending)
                     {
-                        if (!apConfirmed.contains(id) &&
+                        if (IsLocationAllowed(id) &&
+                            !apConfirmed.contains(id) &&
                             !apSent.contains(id))
                             return true;
                     }
@@ -2638,7 +2702,8 @@ bool apSuperClawsStateLoadedSuccessfully = false;
 
                 for (auto id : apPending)
                 {
-                    if (!apConfirmed.contains(id) &&
+                    if (IsLocationAllowed(id) &&
+                        !apConfirmed.contains(id) &&
                         !apSent.contains(id))
                     {
                         batch.push_back(id);
@@ -2986,6 +3051,36 @@ LoadPowerShieldState();
                         if (value >= 0 && value <= 2)
                             apSelectedGoal = value;
                     }
+                    // Read DLC setting from authenticated slot data.
+                    apIncludeDlc = true;
+                    if (packet.contains("slot_data") && packet["slot_data"].is_object())
+                    {
+                        const auto& slotData = packet["slot_data"];
+                        if (slotData.contains("include_dlc"))
+                        {
+                            const auto& option = slotData["include_dlc"];
+                            if (option.is_boolean())
+                                apIncludeDlc = option.get<bool>();
+                            else if (option.is_number_integer())
+                                apIncludeDlc = option.get<int>() != 0;
+                        }
+                    }
+                    // Rank threshold sent by the APWorld: 0=D, 1=C, 2=B, 3=A.
+                    apRequiredRankForAllChecks = 3;
+                    if (packet.contains("slot_data") && packet["slot_data"].is_object())
+                    {
+                        const auto& slotData = packet["slot_data"];
+                        if (slotData.contains("required_rank_for_all_checks") &&
+                            slotData["required_rank_for_all_checks"].is_number_integer())
+                        {
+                            const int selected = slotData["required_rank_for_all_checks"].get<int>();
+                            if (selected >= 0 && selected <= 3)
+                                apRequiredRankForAllChecks = selected;
+                        }
+                    }
+                    std::printf("AP RANK ALL-CHECK THRESHOLD: %c\n",
+                        "DCBA"[apRequiredRankForAllChecks]);
+                    std::printf("AP DLC CHECKS: %s\n", apIncludeDlc ? "ON" : "OFF");
                     std::printf("AP GOAL SELECTED: %d\n", apSelectedGoal);
                     // AP_GOAL_V1_END
                     apAuthenticated = true;
@@ -4844,15 +4939,11 @@ bool APClient::ConsumeIncomingDeathLink()
 }
 void APClient::QueueLocationCheck(std::int64_t locationId)
 {
+    std::size_t queuedCount = 0;
     {
         std::lock_guard<std::mutex> lock(apMutex);
 
-        // Ne jamais enregistrer un check sans room authentifiee.
-
-        if (!apAuthenticated || apDisconnectRequested)
-            return;
-
-        if (apConfirmed.contains(locationId))
+        if (!apAuthenticated || apDisconnectRequested || !IsLocationAllowed(locationId))
             return;
 
         if (!apCheckStateLoadedSuccessfully)
@@ -4861,24 +4952,48 @@ void APClient::QueueLocationCheck(std::int64_t locationId)
             return;
         }
 
-        if (!apPending.insert(locationId).second)
+        // A qualifying rank unlocks all D/C/B/A checks for this SAME Act.
+        // The existing hooks still decide which rank location IDs to report.
+        std::int64_t rankBase = 0;
+        int rankIndex = -1;
+        const bool unlockAllRanks =
+            GetRankLocationGroup(locationId, rankBase, rankIndex) &&
+            rankIndex >= apRequiredRankForAllChecks;
+
+        std::vector<std::int64_t> newChecks;
+        if (unlockAllRanks)
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                const auto id = rankBase + i;
+                if (IsLocationAllowed(id) && !apConfirmed.contains(id) &&
+                    apPending.insert(id).second)
+                    newChecks.push_back(id);
+            }
+        }
+        else if (!apConfirmed.contains(locationId) &&
+                 apPending.insert(locationId).second)
+        {
+            newChecks.push_back(locationId);
+        }
+
+        if (newChecks.empty())
             return;
 
-        // Enregistrer le check avant de permettre son envoi.
+        // Save all newly queued rank checks together. Roll back on failure.
         if (!SaveCheckState())
         {
-            apPending.erase(locationId);
+            for (const auto id : newChecks)
+                apPending.erase(id);
             std::printf("AP CHECK BLOCKED: save failed\n");
             return;
         }
+        queuedCount = newChecks.size();
     }
 
-    std::printf(
-        "AP CHECK QUEUED: %lld\n",
-        static_cast<long long>(locationId)
-    );
+    std::printf("AP CHECK QUEUED: %lld (%zu new checks)\n",
+        static_cast<long long>(locationId), queuedCount);
     std::fflush(stdout);
-
     apWake.notify_all();
 }
 

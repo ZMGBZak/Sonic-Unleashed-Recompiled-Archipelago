@@ -42,11 +42,8 @@ bool PersistentStorageManager::LoadBinary()
 
     if (!std::filesystem::exists(dataPath))
     {
-        // Try loading base persistent data as fallback.
-        dataPath = GetDataPath(false);
-
-        if (!std::filesystem::exists(dataPath))
-            return true;
+        // Archipelago: never load Vanilla persistent data.
+        return true;
     }
 
     std::error_code ec;

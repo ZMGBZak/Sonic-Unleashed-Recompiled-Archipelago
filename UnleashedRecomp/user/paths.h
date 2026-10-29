@@ -28,18 +28,12 @@ inline std::filesystem::path GetGamePath()
 
 inline std::filesystem::path GetSavePath(bool checkForMods)
 {
-    if (checkForMods && !ModLoader::s_saveFilePath.empty())
-        return ModLoader::s_saveFilePath.parent_path();
-    else
-        return GetUserPath() / "save";
+    return GetUserPath() / "save_archipelago";
 }
 
 // Returned file name may not necessarily be
 // equal to SYS-DATA as mods can assign anything.
 inline std::filesystem::path GetSaveFilePath(bool checkForMods)
 {
-    if (checkForMods && !ModLoader::s_saveFilePath.empty())
-        return ModLoader::s_saveFilePath;
-    else
-        return GetSavePath(false) / "SYS-DATA";
+    return GetSavePath(false) / "SYS-DATA";
 }
