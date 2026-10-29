@@ -2707,24 +2707,47 @@ static void DrawAPMedalsHud()
 {
     const int medalCount = APClient::GetMedalGoalCount();
     if (medalCount < 0) return;
+    // AP_MEDALS_EMBEDDED_RESOURCE_V1
     if (!g_apMedalsAtlasAttempted)
     {
         g_apMedalsAtlasAttempted = true;
-        std::ifstream file("ap_medals_atlas.dds", std::ios::binary | std::ios::ate);
-        if (file)
+
+#ifdef _WIN32
+        HMODULE module = GetModuleHandleW(nullptr);
+
+        HRSRC resource = FindResourceA(
+            module,
+            MAKEINTRESOURCEA(2001),
+            RT_RCDATA
+        );
+
+        if (resource)
         {
-            const auto size = file.tellg();
-            if (size > 0 && size < 40000000)
+            DWORD resourceSize = SizeofResource(module, resource);
+            HGLOBAL loaded = LoadResource(module, resource);
+
+            if (loaded && resourceSize > 0)
             {
-                std::vector<uint8_t> bytes(static_cast<size_t>(size));
-                file.seekg(0);
-                if (file.read(reinterpret_cast<char*>(bytes.data()), bytes.size()))
-                    g_apMedalsAtlas = LoadTexture(bytes.data(), bytes.size());
+                const void* data = LockResource(loaded);
+
+                if (data)
+                {
+                    g_apMedalsAtlas = LoadTexture(
+                        static_cast<const uint8_t*>(data),
+                        static_cast<size_t>(resourceSize)
+                    );
+                }
             }
         }
-        if (!g_apMedalsAtlas) std::printf("AP MEDALS HUD: ap_medals_atlas.dds missing or invalid\n");
-    }
+#endif
 
+        if (!g_apMedalsAtlas)
+        {
+            std::printf(
+                "AP MEDALS HUD: embedded atlas missing or invalid\n"
+            );
+        }
+    }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float scale = std::clamp(display.y / 1080.0f, 0.65f, 1.6f);
     const float iconSize = 104.0f * scale;

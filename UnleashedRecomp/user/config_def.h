@@ -1,9 +1,9 @@
-﻿// This file gets included in both config.h and config.cpp, with their own macros changing
+// This file gets included in both config.h and config.cpp, with their own macros changing
 // the preprocessed output. The header is only going to have the declarations this way.
 
 CONFIG_DEFINE("Archipelago", std::string, ArchipelagoServer, "archipelago.gg");
-CONFIG_DEFINE("Archipelago", int32_t, ArchipelagoPort, 57558);
-CONFIG_DEFINE("Archipelago", std::string, ArchipelagoSlot, "ZackU");
+CONFIG_DEFINE("Archipelago", int32_t, ArchipelagoPort, 0);
+CONFIG_DEFINE("Archipelago", std::string, ArchipelagoSlot, "");
 CONFIG_DEFINE("Archipelago", bool, DeathLinkSonicDay, true);
 CONFIG_DEFINE("Archipelago", bool, DeathLinkWerehog, true);
 CONFIG_DEFINE_ENUM_LOCALISED("System", ELanguage, Language, ELanguage::English);

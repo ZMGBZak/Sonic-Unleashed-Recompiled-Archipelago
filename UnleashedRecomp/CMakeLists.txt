@@ -288,6 +288,7 @@ if (WIN32)
     # Set Win32 icon path.
     set(WIN32_ICON_PATH "${PROJECT_SOURCE_DIR}/../UnleashedRecompResources/images/game_icon.ico")
 
+    set(AP_MEDALS_ATLAS_PATH "${PROJECT_SOURCE_DIR}/res/archipelago/ap_medals_atlas.dds")
     configure_file("res/win32/res.rc.template" "${CMAKE_BINARY_DIR}/res.rc" @ONLY)
     add_executable(UnleashedRecomp ${UNLEASHED_RECOMP_CXX_SOURCES} "${CMAKE_BINARY_DIR}/res.rc")
 

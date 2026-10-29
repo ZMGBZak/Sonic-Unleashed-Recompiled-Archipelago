@@ -113,11 +113,7 @@ namespace CustomMusic
     // AP_BOSS_DIAGNOSTIC_V1 - temporary file diagnostics
     static void ApBossDiag(const char* message, int value, int extra = -999)
     {
-        if (FILE* f = std::fopen("ap_music.log", "a"))
-        {
-            std::fprintf(f, "[BOSS DIAG] %s value=%d extra=%d\n", message, value, extra);
-            std::fclose(f);
-        }
+    // AP music file diagnostic disabled for release.
     }
     // END AP_BOSS_DIAGNOSTIC_V1
     // AP_GAME_LOOP_PLAYBACK_V1: saved per-file loop points for SDL_mixer music.
@@ -737,11 +733,7 @@ s_initialized = true;
         // AP_TOWN_STOP_GUARD_V2: preserve Town WAV across first unexpected stop.
         if (s_townPlaybackActive.load() && s_townIgnoreNextStop.exchange(false))
         {
-            if (FILE* f = std::fopen("ap_music.log", "a"))
-            {
-                std::fprintf(f, "[TOWN GUARD] Ignored first RequestStop after town start\n");
-                std::fclose(f);
-            }
+    // AP music file diagnostic disabled for release.
             return;
         }
         s_townPlaybackActive.store(false);
@@ -749,11 +741,7 @@ s_initialized = true;
         // AP_BOSS_STOP_GUARD_V1: preserve boss WAV across the first unexpected stop.
         if (s_bossPlaybackActive.load() && s_bossIgnoreNextStop.exchange(false))
         {
-            if (FILE* f = std::fopen("ap_music.log", "a"))
-            {
-                std::fprintf(f, "[BOSS GUARD] Ignored first RequestStop after boss start\n");
-                std::fclose(f);
-            }
+    // AP music file diagnostic disabled for release.
             return;
         }
         s_bossPlaybackActive.store(false);

@@ -1370,18 +1370,7 @@ PPC_FUNC(sub_8250F2B8)
 
 // END AP_CUSTOM_MUSIC_HOOK
 
-    if (FILE* f = std::fopen("ap_music.log", "a"))
-    {
-        std::fprintf(
-            f,
-            "BGM bank='%s' cue='%s' flag=%u\n",
-            bank,
-            cue,
-            static_cast<unsigned>(ctx.r6.u32 & 0xFFu)
-        );
-
-        std::fclose(f);
-    }
+    // AP music file diagnostic disabled for release.
 
     // AP_TOWN_MUSIC_V1 - leave the game's BGM untouched if no WAV is configured.
     if (CustomMusic::IsEnabled())
@@ -1546,11 +1535,7 @@ PPC_FUNC_IMPL(__imp__sub_82B42140);
 
 static void ApMusicResultLog(const char* event)
 {
-    if (FILE* f = std::fopen("ap_music.log", "a"))
-    {
-        std::fprintf(f, "BGM EVENT %s\n", event);
-        std::fclose(f);
-    }
+    // AP music file diagnostic disabled for release.
 }
 
 PPC_FUNC(sub_82B421A0)
@@ -1588,11 +1573,7 @@ PPC_FUNC(sub_82B42D48)
     const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - s_t0).count();
 
-    if (FILE* f = std::fopen("ap_music.log", "a"))
-    {
-        std::fprintf(f, "BGM D48 t=%lldms r3=0x%08X r4=0x%08X\n", ms, ctx.r3.u32, ctx.r4.u32);
-        std::fclose(f);
-    }
+    // AP music file diagnostic disabled for release.
 
     // BEGIN AP_ACT1_DEFERRED trigger
     // Fin de cinematique (MsgFinishMovie -> sub_82B42D48) : demarre la musique Act 1 si elle est en attente
