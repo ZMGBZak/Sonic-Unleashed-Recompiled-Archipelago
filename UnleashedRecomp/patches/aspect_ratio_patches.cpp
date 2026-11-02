@@ -1,6 +1,7 @@
 
 
 #include <cstdio>
+#include <cstdarg> // AP_ACT_DIAG_COMPAT
 #include "../archipelago_client.h"
 #include "ap_stage_registry.h"
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <cstdint>
+#include <mutex> // AP_RING_ROULETTE_V1
 #include <user/config.h>
 #include <api/SWA.h>
 #include <app.h>
@@ -23,8 +25,13 @@
 #include <ppc/ppc_recomp_shared.h>
 #include "aspect_ratio_patches.h"
 #include "ap_medal_radar.h" // AP_MEDAL_RADAR_AUDIO_V1
+#include "ap_medal_display_names.h" // AP_MEDAL_CHECK_NAMES_V082
+#include "ap_ring_roulette.h" // AP_RING_ROULETTE_V1
 #include "camera_patches.h"
 #include "inspire_patches.h"
+
+// AP_TRAP_ACT_END_GUARD_V082: implemented in input_patches.cpp.
+void AP_NotifyTrapStageFinished();
 
 // These are here for now to not recompile basically all of the project.
 namespace Chao::CSD
@@ -244,7 +251,37 @@ static void GetViewport(void* application, be<uint32_t>* width, be<uint32_t>* he
 GUEST_FUNCTION_HOOK(sub_82E169B8, GetViewport);
 
 
-static void AP_RememberRankStage(const std::string& stage);
+// AP Ring Roulette: game-thread tick. Reuses existing validated hooks.
+static void AP_RouletteGameTick(const std::string& stage, void* saveData);
+static thread_local bool g_apRouletteInjectingRings = false;
+static std::mutex g_apRouletteRingMutex;
+static std::string g_apRouletteRingStage;
+static std::uint32_t g_apRouletteRingObject = 0;
+static bool g_apRouletteRingNight = false;
+// A native gameplay manager is captured only from the existing verified life-read hook.
+// It is revalidated against the currently loaded save before any inventory payout.
+static std::mutex g_apRouletteInventoryMutex;
+static std::uint32_t g_apRouletteInventoryManager = 0;
+static std::chrono::steady_clock::time_point g_apRouletteInventorySeen{};
+static std::chrono::steady_clock::time_point g_apRouletteRingSeen;
+static bool AP_RouletteIsAct(const char* stage)
+{
+    return stage &&
+        (std::strncmp(stage, "ActD_", 5) == 0 ||
+         std::strncmp(stage, "ActN_", 5) == 0 ||
+         std::strcmp(stage, "Act_EggmanLand") == 0);
+}
+static void AP_RouletteRememberRing(std::uint32_t manager, bool isNight, const char* stage)
+{
+    if (!manager || !AP_RouletteIsAct(stage)) return;
+    std::lock_guard<std::mutex> lock(g_apRouletteRingMutex);
+    g_apRouletteRingStage = stage;
+    g_apRouletteRingObject = manager;
+    g_apRouletteRingNight = isNight;
+    g_apRouletteRingSeen = std::chrono::steady_clock::now();
+}
+
+void AP_RememberRankStage(const std::string& stage);
 
 static void AP_WatchActRank()
 {
@@ -255,10 +292,20 @@ static void AP_WatchActRank()
     auto* gameDoc = SWA::CGameDocument::GetInstance();
 
     if (!gameDoc || !gameDoc->m_pMember)
+    {
+        APRingRoulette::inAct.store(false, std::memory_order_release);
+        { std::lock_guard<std::mutex> lock(g_apRouletteRingMutex);
+          g_apRouletteRingObject = 0;
+          g_apRouletteRingStage.clear(); }
+        { std::lock_guard<std::mutex> lock(g_apRouletteInventoryMutex);
+          g_apRouletteInventoryManager = 0; }
         return;
+    }
 
     const std::string stage =
         gameDoc->m_pMember->m_StageName.c_str();
+    APRingRoulette::inAct.store(AP_RouletteIsAct(stage.c_str()),
+        std::memory_order_release);
 
     // BEGIN AP_MUSIC_RESULT_DIAGNOSTIC
     static std::string apMusicPreviousStage = "<initial>";
@@ -280,6 +327,12 @@ static void AP_WatchActRank()
         AP_RememberRankStage(stage);
         if (stage != lastStage)
         {
+            // Never re-use a Ring manager pointer from the previous Act.
+            { std::lock_guard<std::mutex> lock(g_apRouletteRingMutex);
+              g_apRouletteRingObject = 0;
+              g_apRouletteRingStage.clear(); }
+            { std::lock_guard<std::mutex> lock(g_apRouletteInventoryMutex);
+              g_apRouletteInventoryManager = 0; }
             lastStage = stage;
             LOGFN("AP RANK WATCH: STAGE = {}", stage);
         }
@@ -300,6 +353,8 @@ static void AP_WatchActRank()
 
     if (!saveData)
         return;
+
+    AP_RouletteGameTick(stage, saveData);
 
     // AP Rings : lecture du total sauvegarde (Big Endian).
     static bool apRingsReadLogged = false;
@@ -445,11 +500,26 @@ static void AP_DiagnoseShoesMemory()
     LOGFN("AP CD RAM: total matches={}", cdMatches);
 }
 
+// AP_SHOES_SYNC_V082: appliquer pendant le gameplay apres les pickups.
+extern void AP_SyncShoesFromArchipelago();
+
 // SWA::CGameDocument::ComputeScreenPosition
 PPC_FUNC_IMPL(__imp__sub_8250FC70);
 PPC_FUNC(sub_8250FC70)
 {
     __imp__sub_8250FC70(ctx, base);
+    // AP_SHOES_SYNC_V082: verifier ~20 fois/seconde, au maximum.
+    static uint32_t apShoeSyncCalls = 0;
+    if ((++apShoeSyncCalls & 0x1Fu) == 0)
+    {
+        static auto nextShoeSync = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextShoeSync)
+        {
+            nextShoeSync = now + std::chrono::milliseconds(50);
+            AP_SyncShoesFromArchipelago();
+        }
+    }
     static unsigned int apTriggerCalls = 0;
     if (++apTriggerCalls <= 10) LOGFN("AP FILLER TRIGGER TEST: {} appels", apTriggerCalls);
     // AP Crystal XP : application depuis le thread du jeu.
@@ -2140,7 +2210,7 @@ static void AP_TestCurlWebSocket()
 }
 
 // AP TEST - Exact internal medal ID -> Archipelago location ID mapping.
-// Generated from sonic_unleashed_370_test.apworld / internal_to_id.
+// Matched exactly against sonic_unleashed_V082_medal_names_clean.apworld / internal_to_id.
 // Indices 0..N-1 are still provisional for stages not individually verified.
 static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_Mykonos_Moon_0", 88000003},
@@ -2151,10 +2221,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_MykonosETF_Sun_1", 88000008},
     {"Town_MykonosETF_Moon_0", 88000009},
     {"Town_MykonosETF_Moon_1", 88000010},
-    {"Town_MykonosETF_Night_Sun_0", 88000011},
-    {"Town_MykonosETF_Night_Sun_1", 88000012},
-    {"Town_MykonosETF_Night_Moon_0", 88000013},
-    {"Town_MykonosETF_Night_Moon_1", 88000014},
+    {"Town_MykonosETF_Night_Sun_0", 88000007},
+    {"Town_MykonosETF_Night_Sun_1", 88000008},
+    {"Town_MykonosETF_Night_Moon_0", 88000009},
+    {"Town_MykonosETF_Night_Moon_1", 88000010},
     {"ActD_MykonosAct2_Sun_0", 88000001},
     {"ActD_MykonosAct2_Sun_1", 88000015},
     {"ActD_MykonosAct2_Sun_2", 88000016},
@@ -2202,10 +2272,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_EuropeanCityETF_Sun_1", 88000057},
     {"Town_EuropeanCityETF_Moon_0", 88000058},
     {"Town_EuropeanCityETF_Moon_1", 88000059},
-    {"Town_EuropeanCityETF_Night_Sun_0", 88000060},
-    {"Town_EuropeanCityETF_Night_Sun_1", 88000061},
-    {"Town_EuropeanCityETF_Night_Moon_0", 88000062},
-    {"Town_EuropeanCityETF_Night_Moon_1", 88000063},
+    {"Town_EuropeanCityETF_Night_Sun_0", 88000056},
+    {"Town_EuropeanCityETF_Night_Sun_1", 88000057},
+    {"Town_EuropeanCityETF_Night_Moon_0", 88000058},
+    {"Town_EuropeanCityETF_Night_Moon_1", 88000059},
     {"ActD_EU_Sun_0", 88000064},
     {"ActD_EU_Sun_1", 88000065},
     {"ActD_EU_Sun_2", 88000066},
@@ -2245,10 +2315,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_AfricaETF_Sun_1", 88000100},
     {"Town_AfricaETF_Moon_0", 88000101},
     {"Town_AfricaETF_Moon_1", 88000102},
-    {"Town_AfricaETF_Night_Sun_0", 88000103},
-    {"Town_AfricaETF_Night_Sun_1", 88000104},
-    {"Town_AfricaETF_Night_Moon_0", 88000105},
-    {"Town_AfricaETF_Night_Moon_1", 88000106},
+    {"Town_AfricaETF_Night_Sun_0", 88000099},
+    {"Town_AfricaETF_Night_Sun_1", 88000100},
+    {"Town_AfricaETF_Night_Moon_0", 88000101},
+    {"Town_AfricaETF_Night_Moon_1", 88000102},
     {"ActD_Africa_Sun_0", 88000107},
     {"ActD_Africa_Sun_1", 88000108},
     {"ActD_Africa_Sun_2", 88000109},
@@ -2288,10 +2358,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_ChinaETF_Sun_1", 88000143},
     {"Town_ChinaETF_Moon_0", 88000144},
     {"Town_ChinaETF_Moon_1", 88000145},
-    {"Town_ChinaETF_Night_Sun_0", 88000146},
-    {"Town_ChinaETF_Night_Sun_1", 88000147},
-    {"Town_ChinaETF_Night_Moon_0", 88000148},
-    {"Town_ChinaETF_Night_Moon_1", 88000149},
+    {"Town_ChinaETF_Night_Sun_0", 88000142},
+    {"Town_ChinaETF_Night_Sun_1", 88000143},
+    {"Town_ChinaETF_Night_Moon_0", 88000144},
+    {"Town_ChinaETF_Night_Moon_1", 88000145},
     {"ActD_China_Sun_0", 88000150},
     {"ActD_China_Sun_1", 88000151},
     {"ActD_China_Sun_2", 88000152},
@@ -2342,10 +2412,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_SnowETF_Sun_1", 88000197},
     {"Town_SnowETF_Moon_0", 88000198},
     {"Town_SnowETF_Moon_1", 88000199},
-    {"Town_SnowETF_Night_Sun_0", 88000200},
-    {"Town_SnowETF_Night_Sun_1", 88000201},
-    {"Town_SnowETF_Night_Moon_0", 88000202},
-    {"Town_SnowETF_Night_Moon_1", 88000203},
+    {"Town_SnowETF_Night_Sun_0", 88000196},
+    {"Town_SnowETF_Night_Sun_1", 88000197},
+    {"Town_SnowETF_Night_Moon_0", 88000198},
+    {"Town_SnowETF_Night_Moon_1", 88000199},
     {"ActD_Snow_Sun_0", 88000204},
     {"ActD_Snow_Sun_1", 88000205},
     {"ActD_Snow_Sun_2", 88000206},
@@ -2392,10 +2462,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_PetraCapitalETF_Sun_1", 88000247},
     {"Town_PetraCapitalETF_Moon_0", 88000248},
     {"Town_PetraCapitalETF_Moon_1", 88000249},
-    {"Town_PetraCapitalETF_Night_Sun_0", 88000250},
-    {"Town_PetraCapitalETF_Night_Sun_1", 88000251},
-    {"Town_PetraCapitalETF_Night_Moon_0", 88000252},
-    {"Town_PetraCapitalETF_Night_Moon_1", 88000253},
+    {"Town_PetraCapitalETF_Night_Sun_0", 88000246},
+    {"Town_PetraCapitalETF_Night_Sun_1", 88000247},
+    {"Town_PetraCapitalETF_Night_Moon_0", 88000248},
+    {"Town_PetraCapitalETF_Night_Moon_1", 88000249},
     {"ActD_Petra_Sun_0", 88000254},
     {"ActD_Petra_Sun_1", 88000255},
     {"ActD_Petra_Sun_2", 88000256},
@@ -2435,10 +2505,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_NYCityETF_Sun_1", 88000290},
     {"Town_NYCityETF_Moon_0", 88000291},
     {"Town_NYCityETF_Moon_1", 88000292},
-    {"Town_NYCityETF_Night_Sun_0", 88000293},
-    {"Town_NYCityETF_Night_Sun_1", 88000294},
-    {"Town_NYCityETF_Night_Moon_0", 88000295},
-    {"Town_NYCityETF_Night_Moon_1", 88000296},
+    {"Town_NYCityETF_Night_Sun_0", 88000289},
+    {"Town_NYCityETF_Night_Sun_1", 88000290},
+    {"Town_NYCityETF_Night_Moon_0", 88000291},
+    {"Town_NYCityETF_Night_Moon_1", 88000292},
     {"ActD_NY_Sun_0", 88000297},
     {"ActD_NY_Sun_1", 88000298},
     {"ActD_NY_Sun_2", 88000299},
@@ -2473,10 +2543,10 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"Town_SouthEastAsiaETF_Sun_1", 88000328},
     {"Town_SouthEastAsiaETF_Moon_0", 88000329},
     {"Town_SouthEastAsiaETF_Moon_1", 88000330},
-    {"Town_SouthEastAsiaETF_Night_Sun_0", 88000331},
-    {"Town_SouthEastAsiaETF_Night_Sun_1", 88000332},
-    {"Town_SouthEastAsiaETF_Night_Moon_0", 88000333},
-    {"Town_SouthEastAsiaETF_Night_Moon_1", 88000334},
+    {"Town_SouthEastAsiaETF_Night_Sun_0", 88000327},
+    {"Town_SouthEastAsiaETF_Night_Sun_1", 88000328},
+    {"Town_SouthEastAsiaETF_Night_Moon_0", 88000329},
+    {"Town_SouthEastAsiaETF_Night_Moon_1", 88000330},
     {"ActD_Beach_Sun_0", 88000335},
     {"ActD_Beach_Sun_1", 88000336},
     {"ActD_Beach_Sun_2", 88000337},
@@ -2513,15 +2583,61 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"ActN_SubBeach_01_Sun_2", 88000368},
     {"ActN_SubBeach_01_Sun_3", 88000369},
     {"ActN_SubBeach_01_Moon_0", 88000370},
+    // AP MEDALS VERIFIED: observed on Savannah Citadel Day Act 3.
+    {"ActD_SubAfrica_03_Sun_0", 88000929},
+    {"ActD_SubAfrica_03_Moon_0", 88000930},
+    {"ActD_SubAfrica_03_Moon_1", 88000931},
+    {"ActD_SubAfrica_01_Sun_0", 88000932},
+    {"ActD_SubAfrica_01_Moon_0", 88000933},
+    {"ActD_SubAfrica_01_Moon_1", 88000934},
 };
+
+// AP_ACT_DIAG_COMPAT: diagnostic only - source BEFORE Act Fix V1.
+static void AP_ActDiagLog(const char* format, ...)
+{
+    FILE* file = std::fopen("AP_Acts_Diagnostic.txt", "a");
+    if (!file) return;
+    std::va_list args;
+    va_start(args, format);
+    std::vfprintf(file, format, args);
+    va_end(args);
+    std::fputc('\n', file);
+    std::fclose(file);
+}
+static std::string AP_ActDiagStage()
+{
+    if (auto* doc = SWA::CGameDocument::GetInstance())
+        if (doc->m_pMember)
+            return doc->m_pMember->m_StageName.c_str();
+    return "";
+}
 
 // AP ACT CLEAR + RANK CHECKS (61-stage server test).
 // All 370 medal locations are unchanged. Stage metadata is in ap_stage_registry.h.
 static std::string apRankLastStage;
+static std::chrono::steady_clock::time_point apRankStageSeenAt = std::chrono::steady_clock::now();
 static std::unordered_map<uint32_t, uint32_t> apRankPreviouslyReadByObject;
 
-static void AP_RememberRankStage(const std::string& stage)
+void AP_RememberRankStage(const std::string& stage)
 {
+    static std::string lastLoggedStage;
+    if (lastLoggedStage != stage)
+    {
+        lastLoggedStage = stage;
+        size_t mappedMedals = 0;
+        const std::string prefix = stage + "_";
+        for (const auto& entry : apMedalLocationIds)
+            if (entry.first.compare(0, prefix.size(), prefix) == 0) ++mappedMedals;
+        const auto found = apRankActLocations.find(stage);
+        AP_ActDiagLog("STAGE name='%s' rankRegistry=%d isDlc=%d mappedMedals=%zu",
+            stage.c_str(), found != apRankActLocations.end(),
+            found != apRankActLocations.end() && found->second.isDlc, mappedMedals);
+    }
+    // During transitions/results the game temporarily exposes an empty StageName.
+    // Preserve the last valid Act for the results hook; the 45-second age guard
+    // and the next nonempty stage prevent attribution to an unrelated Act.
+    if (stage.empty())
+        return;
     if (apRankActLocations.find(stage) == apRankActLocations.end())
     {
         // Never attribute a result to a previously played act.
@@ -2533,6 +2649,7 @@ static void AP_RememberRankStage(const std::string& stage)
         return;
     }
 
+    apRankStageSeenAt = std::chrono::steady_clock::now();
     if (stage != apRankLastStage)
     {
         apRankLastStage = stage;
@@ -2557,6 +2674,8 @@ PPC_FUNC(sub_8251C618)
 {
     const uint32_t object = ctx.r3.u32;
     const uint32_t newRank = ctx.r4.u32;
+    AP_ActDiagLog("RANK_SET active='%s' cached='%s' value=%u object=0x%08X",
+        AP_ActDiagStage().c_str(), apRankLastStage.c_str(), newRank, object);
     const auto oldEntry = apRankPreviouslyReadByObject.find(object);
     const bool hasOldRank = oldEntry != apRankPreviouslyReadByObject.end();
     const uint32_t oldRank = hasOldRank ? oldEntry->second : 999;
@@ -2564,40 +2683,141 @@ PPC_FUNC(sub_8251C618)
     // Never change the original game's rank update behavior.
     __imp__sub_8251C618(ctx, base);
 
-    const auto act = apRankActLocations.find(apRankLastStage);
-    if (act == apRankActLocations.end())
-        return;
+    // The setter fires when the game commits a new best rank. A rank 0..4
+    // confirms a successful result; rank 5 indicates no valid completion.
+    // Do not depend on an earlier rank READ for the same save object.
+    const std::string activeStage = AP_ActDiagStage();
+    const bool recent = std::chrono::steady_clock::now() - apRankStageSeenAt <
+        std::chrono::seconds(180);
+    std::string stage;
+    if (apRankActLocations.find(activeStage) != apRankActLocations.end())
+        stage = activeStage;
+    else if (activeStage.empty() && recent &&
+             apRankActLocations.find(apRankLastStage) != apRankActLocations.end())
+        stage = apRankLastStage;
 
-    if (!hasOldRank || oldRank > 5 || newRank > 4)
+    if (stage.empty() || newRank > 4)
     {
-        LOGFN("AP RANK DIAG: stage={} object={} oldKnown={} old={} new={}",
-            apRankLastStage, object, hasOldRank, oldRank, newRank);
+        AP_ActDiagLog("RANK_SET_SKIPPED active='%s' cached='%s' rank=%u recent=%d",
+            activeStage.c_str(), apRankLastStage.c_str(), newRank, recent);
         return;
     }
 
-    LOGFN("AP RANK DIAG: stage={} old={} new={}", apRankLastStage, oldRank, newRank);
-    const auto& locations = act->second;
+    const auto& locations = apRankActLocations.at(stage);
+    const uint32_t ids[] = {locations.actClear, locations.rankD,
+                            locations.rankC, locations.rankB, locations.rankA};
+    APClient::QueueLocationCheck(ids[0]);
+    for (uint32_t t = 4, i = 1; i < 5; ++i, --t)
+        if (newRank <= t) APClient::QueueLocationCheck(ids[i]);
+    AP_ActDiagLog("RANK_SET_CHECK_ATTEMPT stage='%s' rank=%u clear=%u oldKnown=%d oldRank=%u",
+        stage.c_str(), newRank, ids[0], hasOldRank, oldRank);
+    apRankPreviouslyReadByObject[object] = newRank;
+}
 
-    if (oldRank == 5)
+// AP ACT RESULTS V4: native Werehog/Night result path.
+// Proven chain in PPC recompile: sub_82AFxxxx -> sub_82AEE248 computes
+// the grade (0..4 valid, 5 missing), passes it as r9 to sub_82B113F8;
+// sub_82B113F8 commits that grade through sub_8251C618.
+// Run the native function unchanged, then try to report rank checks even
+// if the game does not improve the previous record.
+PPC_FUNC_IMPL(__imp__sub_82B113F8);
+PPC_FUNC(sub_82B113F8)
+{
+    const std::string activeStage = AP_ActDiagStage();
+    const std::string cachedStage = apRankLastStage;
+    const uint32_t completedRank = ctx.r9.u32;
+    const bool recent = std::chrono::steady_clock::now() - apRankStageSeenAt <
+        std::chrono::seconds(180);
+    AP_ActDiagLog("NIGHT_RESULT_ENTER active='%s' cached='%s' rank=%u recent=%d",
+        activeStage.c_str(), cachedStage.c_str(), completedRank, recent);
+    if (completedRank <= 4u) AP_NotifyTrapStageFinished();
+
+    // Preserve the game result, records and original PPC register state.
+    __imp__sub_82B113F8(ctx, base);
+
+    std::string stage;
+    if (apRankActLocations.find(activeStage) != apRankActLocations.end())
+        stage = activeStage;
+    else if (activeStage.empty() && recent &&
+             apRankActLocations.find(cachedStage) != apRankActLocations.end())
+        stage = cachedStage;
+
+    // This hook handles the Werehog result path. Do not attribute a result
+    // from another game mode to a previously cached stage.
+    const bool isNight = stage.rfind("ActN_", 0) == 0 || stage == "Act_EggmanLand";
+    if (!isNight || completedRank > 4)
     {
-        LOGFN("AP CLEAR: {} - {}", locations.displayName, locations.clearLabel);
-        APClient::QueueLocationCheck(locations.actClear);
+        AP_ActDiagLog("NIGHT_RESULT_SKIPPED stage='%s' rank=%u reason='%s'",
+            stage.c_str(), completedRank,
+            !isNight ? "not-recognized-night-act" : "no-valid-rank");
+        return;
     }
 
-    const uint32_t thresholds[] = {4, 3, 2, 1};
-    const uint32_t ids[] = {locations.rankD, locations.rankC, locations.rankB, locations.rankA};
-    const char* labels[] = {"D", "C", "B", "A"};
-
-    for (size_t i = 0; i < 4; ++i)
-    {
-        if (oldRank > thresholds[i] && newRank <= thresholds[i])
-        {
-            LOGFN("AP RANK CHECK: {} - Rank {}", locations.displayName, labels[i]);
+    const auto& a = apRankActLocations.at(stage);
+    const uint32_t ids[] = {a.actClear, a.rankD, a.rankC, a.rankB, a.rankA};
+    APClient::QueueLocationCheck(ids[0]);
+    for (uint32_t threshold = 4, i = 1; i < 5; ++i, --threshold)
+        if (completedRank <= threshold)
             APClient::QueueLocationCheck(ids[i]);
+
+    // ATTEMPTED, not guaranteed to be accepted: APClient may reject offline
+    // checks. The client console's AP CHECK QUEUED/CONFIRMED is authoritative.
+    AP_ActDiagLog("NIGHT_RESULT_CHECK_ATTEMPT stage='%s' rank=%u clear=%u",
+        stage.c_str(), completedRank, ids[0]);
+    LOGFN("[AP ACT V4] Night result: stage={} rank={} clearId={} (attempted)",
+        stage, completedRank, ids[0]);
+}
+
+// AP ACT COVERAGE FIX V3: the final-results function is called even when the
+// player does NOT beat an existing best rank. Its PPC body reads the current
+// result rank from *( (*(r3 + 8) + 300) + 60 ). See ppc_recomp.27.cpp.
+// Importantly, do not modify the original game's records or result logic.
+PPC_FUNC_IMPL(__imp__sub_824A1B58);
+PPC_FUNC(sub_824A1B58)
+{
+    const std::string activeStage = AP_ActDiagStage();
+    const std::string cachedStage = apRankLastStage;
+    const auto lastSeen = apRankStageSeenAt;
+    const uint32_t resultsObject = ctx.r3.u32;
+    uint32_t actualRank = 999;
+    if (resultsObject >= 0x10000u && resultsObject < 0x80000000u)
+    {
+        const uint32_t resultsState = PPC_LOAD_U32(resultsObject + 8);
+        if (resultsState >= 0x10000u && resultsState < 0x80000000u)
+        {
+            const uint32_t gradeState = PPC_LOAD_U32(resultsState + 300);
+            if (gradeState >= 0x10000u && gradeState < 0x80000000u)
+                actualRank = PPC_LOAD_U32(gradeState + 60);
         }
     }
+    // The native result transition is an authoritative gameplay-trap cutoff.
+    if (actualRank <= 4u) AP_NotifyTrapStageFinished();
+    // The real game still handles the results with its original function.
+    __imp__sub_824A1B58(ctx, base);
 
-    apRankPreviouslyReadByObject[object] = newRank;
+    std::string stage;
+    if (apRankActLocations.find(activeStage) != apRankActLocations.end())
+        stage = activeStage;
+    else if ((activeStage.empty() || activeStage == cachedStage) &&
+             apRankActLocations.find(cachedStage) != apRankActLocations.end() &&
+             std::chrono::steady_clock::now() - lastSeen < std::chrono::seconds(180))
+        stage = cachedStage;
+
+    AP_ActDiagLog("RESULT_RANK stage='%s' active='%s' cached='%s' rank=%u",
+        stage.c_str(), activeStage.c_str(), cachedStage.c_str(), actualRank);
+    if (stage.empty() || actualRank > 4)
+        return;
+
+    const auto& a = apRankActLocations.at(stage);
+    const uint32_t ids[] = {a.actClear, a.rankD, a.rankC, a.rankB, a.rankA};
+    // Native thresholds: D<=4, C<=3, B<=2, A<=1; 0 also passes all.
+    // All checks for thresholds met by this result are safe to retry because
+    // APClient::QueueLocationCheck deduplicates checked and pending IDs.
+    APClient::QueueLocationCheck(ids[0]);
+    for (uint32_t t = 4, i = 1; i < 5; ++i, --t)
+        if (actualRank <= t) APClient::QueueLocationCheck(ids[i]);
+    AP_ActDiagLog("DAY_RESULT_CHECK_ATTEMPT stage='%s' rank=%u clear=%u",
+        stage.c_str(), actualRank, ids[0]);
 }
 
 // AP TEST - Medal event + Stage ID + Anti-duplicates
@@ -2638,31 +2858,33 @@ if (!apCurlTestDone)
                         stage + "_" + medalType + "_" +
                         std::to_string(extra);
 
-                    auto result = apCollectedMedals.insert(checkID);
-
-                   
-if (result.second)
-{
-    LOGFN("AP CHECK NEW: {}", checkID);
-
-    const auto location = apMedalLocationIds.find(checkID);
-    if (location != apMedalLocationIds.end())
-    {
-        APClient::QueueLocationCheck(location->second);
-        LOGFN("AP LOCATION QUEUED: {} -> {}", checkID, location->second);
-    }
-    else
-    {
-        LOGFN("AP LOCATION UNKNOWN: {}", checkID);
-    }
-}
-else
-{
-    LOGFN("AP CHECK DUPLICATE: {}", checkID);
-}
+                    AP_ActDiagLog("MEDAL_PICKUP stage='%s' type=%u index=%u key='%s' mapped=%d",
+                        stage.c_str(), type, extra, checkID.c_str(),
+                        apMedalLocationIds.find(checkID) != apMedalLocationIds.end());
+                    const bool firstSeenInProcess = apCollectedMedals.insert(checkID).second;
+                    const auto location = apMedalLocationIds.find(checkID);
+                    if (location != apMedalLocationIds.end())
+                    {
+                        // APClient handles pending/confirmed dedup persistently.
+                        // Do NOT block a second pickup because the first one
+                        // may have happened while offline or before authentication.
+                        APClient::QueueLocationCheck(location->second);
+                        const char* apDisplayName = AP_MedalDisplayName(location->second);
+                        LOGFN("AP LOCATION CHECK ATTEMPT: {} -> {} (name='{}' firstThisRun={})",
+                            checkID, location->second,
+                            apDisplayName ? apDisplayName : "Unknown Medal", firstSeenInProcess);
+                        AP_ActDiagLog("MEDAL_CHECK_ATTEMPT key='%s' id=%lld name='%s' firstThisRun=%d",
+                            checkID.c_str(), static_cast<long long>(location->second),
+                            apDisplayName ? apDisplayName : "Unknown Medal", firstSeenInProcess);
+                    }
+                    else
+                    {
+                        LOGFN("AP LOCATION UNKNOWN: {}", checkID);
+                    }
                 }
                 else
                 {
+                    AP_ActDiagLog("MEDAL_PICKUP_NO_STAGE type=%u index=%u", type, extra);
                     LOGFN("AP CHECK: stage unavailable");
                 }
             }
@@ -2905,8 +3127,14 @@ static void AP_MedalRadarV3PlayerSample(uint8_t* base,
     size_t remaining = 0;
     for (const auto& [medalID, medal] : apMedalRadarV3Medals)
     {
-        // Read-only: consult the AP pickup cache but never modify it.
+        // AP_MEDAL_RADAR_PERSIST_V1: consult both the in-session pickup cache
+        // and AP's seed/slot-specific saved or server-confirmed checks.
+        // Do not remove the medal entity: object destruction is not validated.
         if (apCollectedMedals.find(medalID) != apCollectedMedals.end())
+            continue;
+        const auto mappedMedal = apMedalLocationIds.find(medalID);
+        if (mappedMedal != apMedalLocationIds.end() &&
+            APClient::IsLocationChecked(mappedMedal->second))
             continue;
         ++remaining;
         const double dx = double(position.x) - medal.x;
@@ -2997,6 +3225,10 @@ LOGFN("AP MEDAL DEBUG: object={} type={} index={} r4={} r5={} r6={}",
     const std::string medalID =
         stage + "_" + medalType + "_" + std::to_string(index);
 
+    if (stage.find("Sub") != std::string::npos)
+        AP_ActDiagLog("MEDAL_SPAWN stage='%s' type=%u index=%u key='%s' mapped=%d",
+            stage.c_str(), type, index, medalID.c_str(),
+            apMedalLocationIds.find(medalID) != apMedalLocationIds.end());
     if (apDetectedMedals.insert(medalID).second)
     {
         LOGFN("AP MEDAL DETECTED: {}", medalID);
@@ -3096,7 +3328,21 @@ PPC_FUNC_IMPL(__imp__sub_82321640);
 PPC_FUNC(sub_82321640)
 {
 const auto apRingObject = ctx.r3.u32;
+    const auto apOriginalAmount = ctx.r4.u32;
     __imp__sub_82321640(ctx, base);
+    // Only original positive gameplay gains count. AP and roulette bonuses are
+    // injected separately below and MUST NOT advance the wheel counter.
+    if (!g_apRouletteInjectingRings)
+    {
+        const auto* doc = SWA::CGameDocument::GetInstance();
+        const char* stage = (doc && doc->m_pMember)
+            ? doc->m_pMember->m_StageName.c_str() : nullptr;
+        if (stage && std::strncmp(stage, "ActD_", 5) == 0)
+        {
+            AP_RouletteRememberRing(apRingObject, false, stage);
+            APRingRoulette::RecordPickup(apOriginalAmount);
+        }
+    }
 
     // AP Ring Wipe Trap : Sonic Day.
     const auto* apDayWipeDoc = SWA::CGameDocument::GetInstance();
@@ -3574,6 +3820,18 @@ PPC_FUNC(sub_823AF8E8)
 
     // Ajouter les Rings normaux.
     __imp__sub_823AF8E8(ctx, base);
+    if (!g_apRouletteInjectingRings)
+    {
+        const auto* doc = SWA::CGameDocument::GetInstance();
+        const char* stage = (doc && doc->m_pMember)
+            ? doc->m_pMember->m_StageName.c_str() : nullptr;
+        if (stage && (std::strncmp(stage, "ActN_", 5) == 0 ||
+            std::strcmp(stage, "Act_EggmanLand") == 0))
+        {
+            AP_RouletteRememberRing(apRingObject, true, stage);
+            APRingRoulette::RecordPickup(apOriginalRingAmount);
+        }
+    }
 
     // AP Ring Wipe Trap : Werehog.
     const auto* apWipeDoc = SWA::CGameDocument::GetInstance();
@@ -3600,13 +3858,21 @@ PPC_FUNC(sub_823AF8E8)
         {
             if (apCurrentRings > 0)
             {
+                // The game's ring-change function also converts the delta
+                // to HP damage when the Werehog has a certain state flag set.
+                // A negative delta can therefore kill him. Clear only the
+                // ring counter, then call the original function with a ZERO
+                // delta to refresh the game's UI/related bookkeeping safely.
+                const auto apRingWipeSavedCtx = ctx;
+                PPC_STORE_U32(apRingObject + 1632, 0u);
                 ctx.r3.u32 = apRingObject;
-                ctx.r4.u32 = 0u - apCurrentRings;
+                ctx.r4.u32 = 0u;
                 __imp__sub_823AF8E8(ctx, base);
+                ctx = apRingWipeSavedCtx;
             }
 
             APClient::ConfirmRingWipeApplied();
-            LOGFN("AP RING WIPE APPLIED: WEREHOG");
+            LOGFN("AP RING WIPE APPLIED: WEREHOG (rings cleared, HP untouched)");
         }
     }
 
@@ -3624,10 +3890,161 @@ PPC_FUNC(sub_823AF8E8)
         APClient::ConfirmRingBonusApplied();
     }
 }
+// AP Ring Roulette payout on the game thread. Keeps the last observed ring
+// manager for the current Act so a spin after a long idle can pay out without
+// requiring another Ring pickup. AP_WatchActRank clears it on stage changes.
+static void AP_RouletteGameTick(const std::string& stage, void* saveData)
+{
+    using namespace APRingRoulette;
+    if (!AP_RouletteIsAct(stage.c_str())) return;
+    const auto prize = static_cast<Prize>(pending.load(std::memory_order_acquire));
+
+    // These are genuine game rings (not banked save rings). No ring change
+    // callbacks are required after activating the roulette.
+    if (prize == Prize::Ring1 || prize == Prize::Ring100)
+    {
+        const std::uint32_t amount = prize == Prize::Ring1 ? 1u : 100u;
+        std::uint32_t manager = 0;
+        bool night = false;
+        {
+            std::lock_guard<std::mutex> lock(g_apRouletteRingMutex);
+            if (g_apRouletteRingObject && g_apRouletteRingStage == stage)
+            {
+                manager = g_apRouletteRingObject;
+                night = g_apRouletteRingNight;
+            }
+        }
+        if (manager)
+        {
+            const auto address = manager + (night ? 1632u : 1336u);
+            const std::uint32_t before = __builtin_bswap32(*reinterpret_cast<volatile std::uint32_t*>(g_memory.base + address));
+            if (before < 999999u && amount <= 999999u - before)
+            {
+                g_apRouletteInjectingRings = true;
+                if (night)
+                    GuestToHostFunction<void>(sub_823AF8E8, manager, amount);
+                else
+                    GuestToHostFunction<void>(sub_82321640, manager, amount);
+                g_apRouletteInjectingRings = false;
+                const std::uint32_t after = __builtin_bswap32(*reinterpret_cast<volatile std::uint32_t*>(g_memory.base + address));
+                if (after > before)
+                {
+                    Finish(prize);
+                    LOGFN("[RING ROULETTE] Rings: {} -> {}", before, after);
+                }
+            }
+        }
+    }
+    else if (prize == Prize::Hotdog && saveData)
+    {
+        // The same native inventory functions already used in the inventory
+        // menu can be called from this verified GAME-thread Act callback.
+        // Never call them from the UI renderer or with an unvalidated guest manager.
+        static auto nextAttempt = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextAttempt) return;
+        nextAttempt = now + std::chrono::milliseconds(350);
+
+        std::uint32_t manager = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_apRouletteInventoryMutex);
+            if (g_apRouletteInventoryManager &&
+                now - g_apRouletteInventorySeen <= std::chrono::seconds(3))
+                manager = g_apRouletteInventoryManager;
+        }
+        if (!manager) return;
+        const auto saveGuest = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(saveData) -
+            reinterpret_cast<std::uintptr_t>(g_memory.base));
+        // This is a native helper, not a PPC_FUNC(ctx, base) callback.
+        // Read the guest big-endian save pointer explicitly.
+        const std::uint32_t managerSaveGuest = __builtin_bswap32(
+            *reinterpret_cast<volatile const std::uint32_t*>(
+                g_memory.base + manager + 148u));
+        if (managerSaveGuest != saveGuest) return;
+
+        constexpr std::uint32_t kHotdogId = 111u;
+        const std::uint32_t before = GuestToHostFunction<std::uint32_t>(
+            sub_82519C38, manager, kHotdogId);
+        if (before >= 99u) return; // Do not discard the reward if inventory is full.
+        GuestToHostFunction<void>(sub_8251B810, manager, kHotdogId, 1);
+        const std::uint32_t after = GuestToHostFunction<std::uint32_t>(
+            sub_82519C38, manager, kHotdogId);
+        if (after > before)
+        {
+            Finish(Prize::Hotdog);
+            LOGFN("[RING ROULETTE] Gameplay Hotdog awarded: {} -> {}", before, after);
+        }
+    }
+    else if (prize == Prize::Score50000)
+    {
+        // Experimental: native score info verified via SWA CGameDocument.
+        auto* doc = SWA::CGameDocument::GetInstance();
+        if (!doc || !doc->m_pMember) return;
+        const std::uint32_t previous = doc->m_pMember->m_ScoreInfo.TrickScore;
+        const std::uint32_t next = previous > UINT32_MAX - 50000u
+            ? UINT32_MAX : previous + 50000u;
+        doc->m_pMember->m_ScoreInfo.TrickScore = next;
+        Finish(prize);
+        LOGFN("[RING ROULETTE] Bonus score: {} -> {} (verify HUD/results)", previous, next);
+    }
+    else if (prize == Prize::Jackpot777 && saveData &&
+        !appliedJackpotBank.load(std::memory_order_acquire))
+    {
+        // The saved Rings bank offset is from the existing AP Rings save hook.
+        // 100,000 is deliberately credited to banked Rings rather than the
+        // in-level HUD ring counter (which can have a much smaller cap).
+        auto* bank = reinterpret_cast<std::uint8_t*>(saveData) + 0x85A8;
+        const std::uint32_t before =
+            (std::uint32_t(bank[0]) << 24) | (std::uint32_t(bank[1]) << 16) |
+            (std::uint32_t(bank[2]) << 8) | std::uint32_t(bank[3]);
+        const std::uint32_t after = before > UINT32_MAX - 100000u
+            ? UINT32_MAX : before + 100000u;
+        bank[0] = static_cast<std::uint8_t>(after >> 24);
+        bank[1] = static_cast<std::uint8_t>(after >> 16);
+        bank[2] = static_cast<std::uint8_t>(after >> 8);
+        bank[3] = static_cast<std::uint8_t>(after);
+        appliedJackpotBank.store(true, std::memory_order_release);
+        LOGFN("[RING ROULETTE] JACKPOT saved ring bank: {} -> {}", before, after);
+        TryFinishJackpot();
+    }
+    // Minute60 deliberately waits: timer structure is not yet verified.
+    // Do not silently mutate unknown memory addresses.
+}
+
 // AP DEBUG : observer le gestionnaire de vies sans modifier les vies.
 static thread_local int apLifeSource = 0;
+// Death Link V0.8.2: time-based protection shared by Sonic Day and Werehog.
+// Do not clear this protection as soon as a life is deducted: the death
+// sequence and the subsequent respawn are not necessarily complete yet.
 static bool apInjectedDeath = false;
-static int apInjectedDeathFrames = 0;
+static std::chrono::steady_clock::time_point apDeathLinkShieldUntil{};
+static std::chrono::steady_clock::time_point apNextIncomingDeathLinkAt{};
+static std::chrono::steady_clock::time_point apNextOutgoingDeathLinkAt{};
+
+static bool AP_IsDeathLinkShieldActive()
+{
+    if (apInjectedDeath && std::chrono::steady_clock::now() >= apDeathLinkShieldUntil)
+    {
+        apInjectedDeath = false;
+        LOGFN("[AP DEATH LINK GUARD] Respawn protection expired");
+    }
+    return apInjectedDeath;
+}
+
+static bool AP_CanInjectDeathLink()
+{
+    return !AP_IsDeathLinkShieldActive() &&
+        std::chrono::steady_clock::now() >= apNextIncomingDeathLinkAt;
+}
+
+static void AP_StartIncomingDeathLinkProtection()
+{
+    const auto now = std::chrono::steady_clock::now();
+    apInjectedDeath = true;
+    apDeathLinkShieldUntil = now + std::chrono::seconds(8);
+    apNextIncomingDeathLinkAt = apDeathLinkShieldUntil;
+}
 PPC_FUNC_IMPL(__imp__sub_8251A728);
 PPC_FUNC(sub_8251A728)
 {
@@ -3639,18 +4056,30 @@ PPC_FUNC(sub_8251A728)
         LOGFN("[AP LIFE SOURCE] source={} manager={:08X} delta={}",
             apLifeSource, apLifeManager, apLifeDelta);
 
-        if (apInjectedDeath && apLifeDelta == -1)
+        const auto now = std::chrono::steady_clock::now();
+        const bool incomingShield = AP_IsDeathLinkShieldActive();
+        if (incomingShield)
         {
-            LOGFN("[AP DEATH LINK INJECT] Perte de vie confirmee, protection reinitialisee");
-            apInjectedDeath = false;
-            apInjectedDeathFrames = 0;
+            // The received death is still in progress: never echo it to AP.
+            LOGFN("[AP DEATH LINK GUARD] Life deduction during received Death Link (suppressed)");
         }
-        else if (apLifeSource == 0 && apLifeDelta == -1 && !apInjectedDeath)
+        else if (apLifeSource == 0 && apLifeDelta == -1 &&
+            now >= apNextOutgoingDeathLinkAt)
         {
+            // Some death sequences subtract a life more than once. Send a
+            // single Death Link for the death event, not one per hook call.
+            apNextOutgoingDeathLinkAt = now + std::chrono::seconds(5);
             LOGFN("[AP DEATH LINK LOCAL] Natural death candidate");
-            LOGFN("[AP DEATH LINK CALL] Calling QueueDeathLink");
             APClient::QueueDeathLink();
             LOGFN("[AP DEATH LINK RETURN] QueueDeathLink finished");
+        }
+        if (!incomingShield && apLifeDelta == -1)
+        {
+            // Wait until a local death's respawn has finished before
+            // consuming pending remote deaths (the queue stays intact).
+            const auto resumeAt = now + std::chrono::seconds(6);
+            if (apNextIncomingDeathLinkAt < resumeAt)
+                apNextIncomingDeathLinkAt = resumeAt;
         }
     }
 }
@@ -3661,6 +4090,14 @@ PPC_FUNC(sub_8251A5B0)
 {
     static uint32_t lastManager = 0;
     const uint32_t manager = ctx.r3.u32;
+    // Cache only a manager observed through the game itself. The gameplay
+    // payout also checks that manager+148 still points at the CURRENT save.
+    if (manager != 0)
+    {
+        std::lock_guard<std::mutex> lock(g_apRouletteInventoryMutex);
+        g_apRouletteInventoryManager = manager;
+        g_apRouletteInventorySeen = std::chrono::steady_clock::now();
+    }
     if (manager != lastManager)
     {
         LOGFN("AP LIFE READ: manager={:08X}", manager);
@@ -3754,6 +4191,49 @@ PPC_FUNC(sub_8251A5B0)
                     PPC_LOAD_U32(saveBase + 32768));
 
                 APClient::ConfirmLifeBonusApplied();
+            }
+        }
+    }
+
+    // Ring Roulette lives: same verified manager/save path as AP Bonus Life.
+    const auto reward = static_cast<APRingRoulette::Prize>(
+        APRingRoulette::pending.load(std::memory_order_acquire));
+    if (manager != 0 &&
+        (reward == APRingRoulette::Prize::Life1 ||
+         reward == APRingRoulette::Prize::Life3 ||
+         reward == APRingRoulette::Prize::Jackpot777))
+    {
+        const auto data = PPC_LOAD_U32(manager + 152);
+        const auto saveBase = PPC_LOAD_U32(manager + 148);
+        if (data != 0 && saveBase != 0 && PPC_LOAD_U8(data + 32) == 0)
+        {
+            const std::uint32_t before = PPC_LOAD_U32(saveBase + 32768);
+            if (before <= 99u)
+            {
+                const std::uint32_t target = reward == APRingRoulette::Prize::Jackpot777
+                    ? 99u : (std::min)(99u, before +
+                        (reward == APRingRoulette::Prize::Life3 ? 3u : 1u));
+                if (target > before)
+                {
+                    const auto oldR3 = ctx.r3;
+                    const auto oldR4 = ctx.r4;
+                    ctx.r3.u32 = manager;
+                    ctx.r4.s32 = static_cast<std::int32_t>(target - before);
+                    __imp__sub_8251A728(ctx, base);
+                    ctx.r3 = oldR3;
+                    ctx.r4 = oldR4;
+                }
+                const std::uint32_t after = PPC_LOAD_U32(saveBase + 32768);
+                if (after == target)
+                {
+                    LOGFN("[RING ROULETTE] Lives {} -> {}", before, after);
+                    if (reward == APRingRoulette::Prize::Jackpot777)
+                    {
+                        APRingRoulette::appliedJackpotLives.store(true, std::memory_order_release);
+                        APRingRoulette::TryFinishJackpot();
+                    }
+                    else APRingRoulette::Finish(reward);
+                }
             }
         }
     }
@@ -3865,19 +4345,8 @@ PPC_FUNC(sub_82310F20)
         apLoggedSonicUpdate = true;
     }
 
-    if (apInjectedDeath)
-    {
-        ++apInjectedDeathFrames;
-
-        if (apInjectedDeathFrames >= 600)
-        {
-            LOGFN("[AP DEATH LINK WARNING] Injection timeout");
-            apInjectedDeath = false;
-            apInjectedDeathFrames = 0;
-        }
-    }
-
-    if (sonicObject != 0 && !apInjectedDeath)
+    // Time-based guard also expires if the last Death Link happened at night.
+    if (sonicObject != 0 && AP_CanInjectDeathLink())
     {
         const uint32_t sonicContext =
             PPC_LOAD_U32(sonicObject + 196);
@@ -3889,8 +4358,7 @@ PPC_FUNC(sub_82310F20)
             LOGFN("[AP DEATH LINK INJECT] Sonic Day Context={:08X}",
                 sonicContext);
 
-            apInjectedDeath = true;
-            apInjectedDeathFrames = 0;
+            AP_StartIncomingDeathLinkProtection();
 
             PPCContext deathCtx = ctx;
             deathCtx.r3.u32 = sonicContext;
@@ -3957,7 +4425,7 @@ PPC_FUNC(sub_823B0168)
 
     if (apStats != 0 &&
         apValidWerehogStage &&
-        !apInjectedDeath)
+        AP_CanInjectDeathLink())
     {
         const uint32_t apHPBefore =
             PPC_LOAD_U32(apStats + 1660);
@@ -3966,8 +4434,7 @@ PPC_FUNC(sub_823B0168)
             Config::DeathLinkWerehog.Value &&
             APClient::ConsumeIncomingDeathLink())
         {
-            apInjectedDeath = true;
-            apInjectedDeathFrames = 0;
+            AP_StartIncomingDeathLinkProtection();
 
             PPC_STORE_U32(apStats + 1660, 0);
 

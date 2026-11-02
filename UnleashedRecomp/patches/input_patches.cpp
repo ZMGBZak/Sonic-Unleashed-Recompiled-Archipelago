@@ -462,6 +462,63 @@ PPC_FUNC(sub_8256C938)
     }
 }
 
+// BEGIN AP_TRAP_ACT_END_GUARD_V082
+// The stage name can remain ActD_/ActN_ while the game enters results.
+// No state-changing trap may be injected after a clear/results transition.
+// AP items remain pending and become eligible again in the next playable Act.
+namespace ApTrapActEnd
+{
+    static std::atomic<bool> resultsStarted{false};
+    static std::atomic<bool> resumeRequested{false};
+    static std::atomic<long long> resumeAtMs{0};
+
+    static bool IsActive()
+    {
+        return resultsStarted.load(std::memory_order_acquire);
+    }
+
+    static void BeginResults()
+    {
+        resumeRequested.store(false, std::memory_order_release);
+        if (!resultsStarted.exchange(true, std::memory_order_acq_rel))
+            LOGFN("[AP TRAP ACT END] Results started; defer gameplay traps");
+    }
+
+    static void LoadingFinished()
+    {
+        // Loading the RESULTS screen must not reactivate traps. Wait until a
+        // genuine player update occurs in a level after the normal load delay.
+        if (resultsStarted.load(std::memory_order_acquire))
+        {
+            const auto now = std::chrono::steady_clock::now().time_since_epoch();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+            resumeAtMs.store(ms + 3000, std::memory_order_release);
+            resumeRequested.store(true, std::memory_order_release);
+        }
+    }
+
+    static void ResumeOnPlayerUpdate(bool knownGameplayStage)
+    {
+        if (!knownGameplayStage || !resultsStarted.load(std::memory_order_acquire) ||
+            !resumeRequested.load(std::memory_order_acquire))
+            return;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        if (ms < resumeAtMs.load(std::memory_order_acquire))
+            return;
+        resumeRequested.store(false, std::memory_order_release);
+        resultsStarted.store(false, std::memory_order_release);
+        LOGFN("[AP TRAP ACT END] Player active after loading; queued traps re-enabled");
+    }
+}
+
+// Called by the native Day/Night result hooks in aspect_ratio_patches.cpp.
+void AP_NotifyTrapStageFinished()
+{
+    ApTrapActEnd::BeginResults();
+}
+
+// END AP_TRAP_ACT_END_GUARD_V082
 // BEGIN AP_FREEZE_AUTO_GUARD_V1
 namespace ApFreezeAuto
 {
@@ -509,9 +566,12 @@ void AP_RequestFreezeRestart()
 
 void AP_NotifyFreezeLoadingEnd()
 {
+    ApTrapActEnd::LoadingFinished();
     ApFreezeAuto::NotifyLoadingEnd();
 }
 // END AP_FREEZE_AUTO_GUARD_V1
+// QTE guard is implemented later in ApQteDoom.
+static bool AP_IsQteGuardActive();
 // AP Reverse Controls Trap - etat du minuteur.
 static bool apReverseControlsActive = false;
 static bool apReverseRestartBlocked = false;
@@ -527,6 +587,7 @@ static constexpr auto apReverseControlsDuration = std::chrono::seconds(10);
 // AP Reverse Controls Trap - niveaux autorises.
 static bool AP_IsReverseControlsStageAllowed()
 {
+    if (ApTrapActEnd::IsActive()) return false;
     const auto* doc = SWA::CGameDocument::GetInstance();
 
     if (!doc || !doc->m_pMember)
@@ -614,7 +675,9 @@ PPC_FUNC(sub_822C0288)
     if (apPadArray == 0 || apPadCount == 0 || apPadCount > 4)
         return;
 
+    // AP QTE/TRAP COORDINATION: do not start movement-affecting controls during QTE.
     if (!apReverseControlsActive &&
+        !AP_IsQteGuardActive() &&
         APClient::GetPendingReverseControls() > 0)
     {
         apReverseControlsActive = true;
@@ -768,6 +831,23 @@ PPC_FUNC_IMPL(__imp__sub_82314FE0);
 namespace ApQteDoom
 {
     std::atomic<bool> g_pending{false};
+    // AP FIX 0.8.2 : le QTE natif dure jusqu'a 5 secondes. Interdire
+    // l'injection de paralysie pendant le QTE et sa transition de sortie.
+    static std::atomic<long long> g_qteGuardUntilMs{0};
+    static long long QteNowMs()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    static void MarkQteStarted()
+    {
+        g_qteGuardUntilMs.store(QteNowMs() + 10000,
+                                std::memory_order_release);
+    }
+    static bool QteGuardActive()
+    {
+        return QteNowMs() < g_qteGuardUntilMs.load(std::memory_order_acquire);
+    }
     constexpr uint32_t kCSonicVtable = 0x82016BF4; // Player::CSonic, Sonic Day
 
     // Disposition du scratch guest (offsets depuis S ; S est un multiple de 16).
@@ -955,12 +1035,21 @@ namespace ApQteDoom
 
         ctx.r3.u64 = sonic;                              // CSonic*, comme le dispatcher natif
         ctx.r4.u64 = M0;
+        // Proteger meme un eventuel callback synchrone du dispatcher natif.
+        MarkQteStarted();
         __imp__sub_82314FE0(ctx, base);                  // copie tout par valeur, ne garde aucun pointeur
         return nullptr;
     }
 }
 
 void AP_QteOfDoomQueue() { ApQteDoom::g_pending.store(true); }
+
+// Definie apres ApFreezeInject, dans cette meme unite de compilation.
+static bool AP_DisruptiveTrapsBlockQte();
+static bool AP_IsQteGuardActive()
+{
+    return ApQteDoom::QteGuardActive();
+}
 
 void AP_QteOfDoomOnSonicUpdate(PPCContext& ctx, uint8_t* base)
 {
@@ -1053,6 +1142,17 @@ void AP_QteOfDoomOnSonicUpdate(PPCContext& ctx, uint8_t* base)
         return;
     }
 
+    // Reporter les QTE AP/manuels pendant Freeze, Burn, Paralysis ou Reverse Controls.
+    // La demande QTE reste en attente et le delai de disponibilite redemarre.
+    if (AP_DisruptiveTrapsBlockQte())
+    {
+        s_apWaiting = false;
+        return;
+    }
+
+    // Do not attempt manual or AP QTE while the stage is entering results.
+    if (ApTrapActEnd::IsActive()) { s_apWaiting = false; return; }
+
     // Priorite au test manuel, independant d'Archipelago.
     if (ApQteDoom::g_pending.load())
     {
@@ -1075,7 +1175,8 @@ void AP_QteOfDoomOnSonicUpdate(PPCContext& ctx, uint8_t* base)
         return;
     }
 
-    // Ne pas demarrer le QTE Archipelago hors d'un niveau valide.
+    // Ne pas demarrer le QTE Archipelago en fin d'Act ou hors niveau.
+    if (ApTrapActEnd::IsActive()) { s_apWaiting = false; return; }
     if (!apQteStageAllowed)
         return;
 
@@ -1544,6 +1645,7 @@ PPC_FUNC(sub_82B421A0)
     g_apMusicAct1Pending.store(false, std::memory_order_relaxed);
     // END AP_ACT1_DEFERRED cancel-clear
     ApMusicResultLog("CLEAR");
+    ApTrapActEnd::BeginResults();
     CustomMusic::RequestStop();
     __imp__sub_82B421A0(ctx, base);
 }
@@ -1554,6 +1656,7 @@ PPC_FUNC(sub_82B42140)
     g_apMusicAct1Pending.store(false, std::memory_order_relaxed);
     // END AP_ACT1_DEFERRED cancel-result
     ApMusicResultLog("RESULT");
+    ApTrapActEnd::BeginResults();
     CustomMusic::RequestStop();
     __imp__sub_82B42140(ctx, base);
 }
@@ -2002,6 +2105,7 @@ namespace ApFreezeInject
     static std::atomic<bool>      g_burnMode{false};
     // BEGIN AP_PARALYZED_MODE_V1
     static std::atomic<bool>      g_paralyzedMode{false};
+    static std::atomic<long long> g_lastDisruptiveTrapMs{-1000000};
     // END AP_PARALYZED_MODE_V1
     // BEGIN AP_BURN_TYPE_CACHE_V1
     static std::atomic<uint32_t> g_burnCachedType{0xFFFFFFFFu};
@@ -2061,6 +2165,14 @@ namespace ApFreezeInject
     // N'effectue aucun appel natif : arme seulement.
     static bool Arm(uint32_t sonic, bool apOwned = false, bool burnMode = false, bool paralyzedMode = false)
     {
+        if (ApTrapActEnd::IsActive()) return false;
+        // Freeze, Burn and Paralysis can interrupt the native Trick Jump QTE.
+        // Never arm these effects while the QTE is active or recovering.
+        if (ApQteDoom::QteGuardActive())
+        {
+            ApFzTrace::Line("trap d'etat differee : QTE actif ou transition de sortie");
+            return false;
+        }
         if (Disabled())
         {
             ApFzTrace::Line("trap gel : injection desactivee, rien n'est arme");
@@ -2213,6 +2325,11 @@ namespace ApFreezeInject
     // moindre ecriture dans ctx : un retour anticipe ne modifie jamais les registres.
     static void TryInject(PPCContext& ctx, uint8_t* base, uint32_t listener)
     {
+        if (ApTrapActEnd::IsActive())
+        {
+            Expire("fin de niveau / resultats");
+            return;
+        }
         const long long now = ApFzTrace::Ms();
         if (now - g_armMs.load(std::memory_order_relaxed) > kWindowMs) { Expire("fenetre de 5 s ecoulee"); return; }
         if (t_injecting > 0) return;                                          // rappel provoque par l'injection elle-meme
@@ -2288,6 +2405,8 @@ namespace ApFreezeInject
         ApFzTrace::AddCrumb("inject-end", csonic, msg, changes);
         if (changes > 0)
         {
+            // All successful state-changing traps need a grace window before QTE.
+            g_lastDisruptiveTrapMs.store(ApFzTrace::Ms(), std::memory_order_release);
             g_pending.store(false, std::memory_order_release);
             if (g_apOwned.exchange(false, std::memory_order_acq_rel))
             {
@@ -2330,6 +2449,21 @@ PPC_FUNC(sub_8236DFF0)
 }
 
 // END AP_FREEZE_INJECT core
+// AP FIX 0.8.2 : prevent state-changing traps from overlapping QTE.
+static bool AP_DisruptiveTrapsBlockQte()
+{
+    // An armed native injection can become Freeze, Burn or Paralysis.
+    if (ApFreezeInject::g_pending.load(std::memory_order_acquire))
+        return true;
+
+    // Reverse Controls changes locomotion inputs; let the QTE wait until it ends.
+    if (apReverseControlsActive)
+        return true;
+
+    const long long sinceEffect = ApFzTrace::Ms() -
+        ApFreezeInject::g_lastDisruptiveTrapMs.load(std::memory_order_acquire);
+    return sinceEffect >= 0 && sinceEffect < 8000;
+}
 // BEGIN AP_FREEZE_PROBE probe
 // Sonde de diagnostic V7b (journal seul, journalisation reduite). N'altere NI registre, NI memoire invitee, NI flux d'execution :
 // chaque hook lit (lectures verifiees), journalise, puis appelle l'original avec le MEME ctx.
@@ -2817,6 +2951,12 @@ namespace ApDmgDiag
 // Test manuel. Le Werehog conserve son propre hook.
 void AP_SonicDayFreezeManualOnUpdate(PPCContext& ctx, uint8_t* base)
 {
+    const auto* apDoc = SWA::CGameDocument::GetInstance();
+    const char* apStage = (apDoc && apDoc->m_pMember)
+        ? apDoc->m_pMember->m_StageName.c_str() : nullptr;
+    ApTrapActEnd::ResumeOnPlayerUpdate(apStage &&
+        std::strncmp(apStage, "ActD_", 5) == 0);
+    if (ApTrapActEnd::IsActive()) return;
     static unsigned tick = 0;
     if ((++tick % 30u) != 0u) return;
     const auto* doc = SWA::CGameDocument::GetInstance();
@@ -2832,7 +2972,8 @@ void AP_SonicDayFreezeManualOnUpdate(PPCContext& ctx, uint8_t* base)
     if (sonicVtable != ApQteDoom::kCSonicVtable) return;
 
     // BEGIN AP_BURN_MANUAL_V1
-    if (!ApFreezeInject::g_pending.load(std::memory_order_acquire))
+    if (!ApQteDoom::QteGuardActive() &&
+        !ApFreezeInject::g_pending.load(std::memory_order_acquire))
     {
         if (FILE* burnTrigger = std::fopen("ap_burn.trigger", "rb"))
         {
@@ -2846,7 +2987,8 @@ void AP_SonicDayFreezeManualOnUpdate(PPCContext& ctx, uint8_t* base)
     // END AP_BURN_MANUAL_V1
 
     // BEGIN AP_PARALYZED_MANUAL_V1
-    if (!ApFreezeInject::g_pending.load(std::memory_order_acquire))
+    if (!ApQteDoom::QteGuardActive() &&
+        !ApFreezeInject::g_pending.load(std::memory_order_acquire))
     {
         if (FILE* paralyzedTrigger = std::fopen("ap_paralyzed.trigger", "rb"))
         {
@@ -2859,7 +3001,8 @@ void AP_SonicDayFreezeManualOnUpdate(PPCContext& ctx, uint8_t* base)
     }
     // END AP_PARALYZED_MANUAL_V1
     // BEGIN AP_BURN_PARALYZED_AUTO_DAY_V1
-    if (!ApFreezeInject::g_pending.load(std::memory_order_acquire) &&
+    if (!ApQteDoom::QteGuardActive() &&
+        !ApFreezeInject::g_pending.load(std::memory_order_acquire) &&
         ApFzTrace::Ms() -
             ApFreezeInject::g_lastApSuccessMs.load(std::memory_order_acquire) >=
             ApFreezeInject::kApCooldownMs &&
@@ -2878,7 +3021,8 @@ void AP_SonicDayFreezeManualOnUpdate(PPCContext& ctx, uint8_t* base)
     }
     // END AP_BURN_PARALYZED_AUTO_DAY_V1
     // BEGIN AP_FREEZE_AUTO_DAY_V1
-    if (!ApFreezeInject::g_pending.load(std::memory_order_acquire) &&
+    if (!ApQteDoom::QteGuardActive() &&
+        !ApFreezeInject::g_pending.load(std::memory_order_acquire) &&
         ApFzTrace::Ms() - ApFreezeInject::g_lastApSuccessMs.load(std::memory_order_acquire) >=
             ApFreezeInject::kApCooldownMs &&
         ApFreezeAuto::CanTrigger() &&
@@ -2889,6 +3033,8 @@ void AP_SonicDayFreezeManualOnUpdate(PPCContext& ctx, uint8_t* base)
     }
     // END AP_FREEZE_AUTO_DAY_V1
 
+    // Keep a manual Freeze request queued on disk during the QTE.
+    if (ApQteDoom::QteGuardActive()) return;
     FILE* trigger = std::fopen("ap_freeze.trigger", "rb");
     if (!trigger) return;
     std::fclose(trigger);
@@ -3061,7 +3207,10 @@ PPC_FUNC(sub_823C73C8)
          std::strcmp(apTrapStage, "BossPetra") == 0 ||
          std::strcmp(apTrapStage, "BossEggDragoon") == 0);
 
+    ApTrapActEnd::ResumeOnPlayerUpdate(apTrapNightStage &&
+        ctx.r5.u32 == 1u && ctx.r3.u32 > 0x10040u);
     const bool apTrapCanTrigger =
+        !ApTrapActEnd::IsActive() &&
         apTrapNightStage &&
         ctx.r5.u32 == 1u &&
         ctx.r3.u32 > 0x10040u &&
@@ -3079,7 +3228,7 @@ PPC_FUNC(sub_823C73C8)
     if (!apBurnFile && apTrapCanTrigger)
         apAutoBurn = APClient::GetPendingBurn() > 0;
 
-    if (apBurnFile || apAutoBurn)
+    if (!ApTrapActEnd::IsActive() && (apBurnFile || apAutoBurn))
     {
         if (apBurnFile)
         {
@@ -3176,6 +3325,7 @@ PPC_FUNC(sub_823C73C8)
             LOGFN("[AP BURN WEREHOG] Contexte indisponible");
         }
     }
+    if (apBurnFile && ApTrapActEnd::IsActive()) std::fclose(apBurnFile);
     // END AP_WEREHOG_BURN_MANUAL_V1
     // BEGIN AP_WEREHOG_PARALYZED_MANUAL_V1
     // Test manuel uniquement : aucun item Archipelago consomme.
@@ -3185,7 +3335,7 @@ PPC_FUNC(sub_823C73C8)
     if (!apParaFile && apTrapCanTrigger && !apAutoBurn)
         apAutoParalyzed = APClient::GetPendingParalyzed() > 0;
 
-    if (apParaFile || apAutoParalyzed)
+    if (!ApTrapActEnd::IsActive() && (apParaFile || apAutoParalyzed))
     {
         if (apParaFile)
         {
@@ -3274,12 +3424,14 @@ PPC_FUNC(sub_823C73C8)
             LOGFN("[AP PARALYZED WEREHOG] Contexte indisponible");
         }
     }
+    if (apParaFile && ApTrapActEnd::IsActive()) std::fclose(apParaFile);
     // END AP_WEREHOG_PARALYZED_MANUAL_V1
 
     // BEGIN AP_WEREHOG_FREEZE_MANUAL_TEST v1
     static unsigned apFreezePoll = 0;
 
-    if ((++apFreezePoll % 60u) == 0u &&
+    if (!ApTrapActEnd::IsActive() &&
+        (++apFreezePoll % 60u) == 0u &&
         ctx.r5.u32 == 1u &&
         ctx.r3.u32 > 0x10040u &&
         ctx.r1.u32 > 0x10000u)

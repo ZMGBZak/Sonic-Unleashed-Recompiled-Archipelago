@@ -88,10 +88,17 @@ PPC_FUNC(sub_824DCF38)
 // AP Shoes: applique les objets effectivement recus d'Archipelago.
 // Ne jamais acceder a la RAM depuis le thread reseau.
 // ATTENTION: peut modifier SYS-DATA lors de la sauvegarde; utiliser une copie de test.
-extern uint8_t AP_GetReceivedShoeMask();
+extern bool AP_TryGetReceivedShoeMask(uint8_t* outMask); // AP_SHOES_SYNC_V082
 
-static void AP_ShoesDiagnosticAtLoadingEnd()
+// AP_SHOES_SYNC_V082: les Shoes physiques restent visibles mais ne debloquent
+// aucune capacite si l'item correspondant n'a pas ete recu via Archipelago.
+// A appeler uniquement depuis le thread jeu.
+void AP_SyncShoesFromArchipelago()
 {
+    uint8_t receivedMask = 0;
+    if (!AP_TryGetReceivedShoeMask(&receivedMask))
+        return;
+
     auto* gameDoc = SWA::CGameDocument::GetInstance();
     if (!gameDoc || !gameDoc->m_pMember ||
         gameDoc->m_pMember->m_StageName.c_str()[0] == '\0')
@@ -100,52 +107,35 @@ static void AP_ShoesDiagnosticAtLoadingEnd()
     auto* appDoc = SWA::CApplicationDocument::GetInstance();
     if (!appDoc || !appDoc->m_pMember)
         return;
-
     auto* param = appDoc->m_pMember->m_spGameParameter.get();
     if (!param || !param->m_pSaveData.get())
         return;
 
     auto* bytes = reinterpret_cast<uint8_t*>(param->m_pSaveData.get());
-    constexpr size_t shoesOffset = 0x8004;
-    constexpr size_t shoesCount = 4;
-    constexpr size_t saveSize = sizeof(SWA::CGameParameter::SSaveData);
-    if (shoesOffset + shoesCount > saveSize)
+    constexpr size_t offset = 0x8004;
+    constexpr size_t count = 4;
+    if (offset + count > sizeof(SWA::CGameParameter::SSaveData))
         return;
 
-    LOGFN("AP SHOES: avant={:02X} {:02X} {:02X} {:02X}",
-        bytes[shoesOffset], bytes[shoesOffset + 1],
-        bytes[shoesOffset + 2], bytes[shoesOffset + 3]);
-
-    // Les quatre flags doivent etre booleens. Sinon on refuse toute ecriture.
-    for (size_t i = 0; i < shoesCount; ++i)
-    {
-        if (bytes[shoesOffset + i] > 1)
-        {
-            LOGFN("AP SHOES: flags inattendus, aucune ecriture");
+    // Ne jamais ecraser des champs qui ne semblent plus booleens.
+    for (size_t i = 0; i < count; ++i)
+        if (bytes[offset + i] > 1)
             return;
-        }
-    }
-
-    const uint8_t receivedMask = AP_GetReceivedShoeMask();
-    LOGFN("AP SHOES: objets AP recus mask=0x{:02X}",
-        static_cast<uint32_t>(receivedMask));
 
     static constexpr const char* names[4] =
         { "Stomp", "Wall Jump", "Air Boost", "Light Speed Dash" };
-
-    for (size_t i = 0; i < shoesCount; ++i)
+    for (size_t i = 0; i < count; ++i)
     {
-        if ((receivedMask & (1u << i)) && bytes[shoesOffset + i] == 0)
-        {
-            bytes[shoesOffset + i] = 1;
-            LOGFN("AP SHOES UNLOCK: {} offset 0x{:X} 00 -> 01",
-                names[i], static_cast<uint32_t>(shoesOffset + i));
-        }
-    }
+        const uint8_t expected = (receivedMask & (1u << i)) ? 1 : 0;
+        if (bytes[offset + i] == expected)
+            continue;
 
-    LOGFN("AP SHOES: apres={:02X} {:02X} {:02X} {:02X}",
-        bytes[shoesOffset], bytes[shoesOffset + 1],
-        bytes[shoesOffset + 2], bytes[shoesOffset + 3]);
+        LOGFN("AP SHOES SYNC: {} RAM[0x{:X}] {:02X} -> {:02X} ({})",
+            names[i], static_cast<uint32_t>(offset + i),
+            bytes[offset + i], expected,
+            expected ? "recu d'Archipelago" : "pickup vanilla bloque");
+        bytes[offset + i] = expected;
+    }
 }
 
 // The game checks for a bool to render the PS3 transition animation.
@@ -201,7 +191,7 @@ static void AP_CheckCollectibles(const uint8_t* bytes)
             APClient::QueueLocationCheck(88000732LL + n);
     }
 }
-static void AP_ShoesDiagnosticAtLoadingEnd();
+// AP_SHOES_SYNC_V082: fonction definie plus haut.
 
 // SWA::CLoading::Update
 PPC_FUNC_IMPL(__imp__sub_824DAB60);
@@ -320,7 +310,7 @@ PPC_FUNC(sub_824DAB60)
                     }
                 }
                 // END AP_UNIVERSAL_DAY_LOADING_END_V1
-                AP_ShoesDiagnosticAtLoadingEnd();
+                AP_SyncShoesFromArchipelago(); // AP_SHOES_SYNC_V082
             }
             else
             {

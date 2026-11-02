@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #include <Windows.h>
 #include <winhttp.h>
+#include <os/ap_update_helper.h> // embedded EXE self-updater
 #pragma comment(lib, "winhttp.lib")
 #endif
 
@@ -50,14 +51,17 @@
 #include <ui/black_bar.h>
 #include <patches/aspect_ratio_patches.h>
 #include <patches/ap_medal_radar.h> // AP_MEDAL_RADAR_AUDIO_V1
+#include <patches/ap_ring_roulette.h> // AP_RING_ROULETTE_V1
+#include <gpu/ap_roulette_embedded_assets.h> // AP_RING_ROULETTE_EMBEDDED_V3
 #include <user/config.h>
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
 #include <limits>
+#include <random>
+#include <iterator>
 #include "../archipelago_client.h"
-namespace APClient { int GetMedalGoalCount(); }
 #include <sdl_listener.h>
 #include <xxHashMap.h>
 #include <os/process.h>
@@ -1391,100 +1395,39 @@ struct ImGuiPushConstants
 
 extern ImFontBuilderIO g_fontBuilderIO;
 
-// AP_UPDATER_V1_BEGIN - HTTPS version checker only (no file downloads).
+// AP_UPDATER_V4_BEGIN - Game-only updater. APWorld is notification-only.
+// Fixed GitHub repository; release URL and SHA-256 must match the trusted manifest.
 #ifdef _WIN32
 namespace APUpdateV1
 {
-    constexpr const char* kClientVersion = "0.8.0";
-    constexpr const char* kAPWorldVersion = "0.8.0";
-    constexpr const char* kReleasePage = "https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases";
-    static std::atomic<int> status{0}; // 0 idle, 1 checking, 2 complete, 3 error
+    constexpr const char* kClientVersion = "0.8.2"; // First public release after updater test.
+    constexpr const char* kAPWorldVersion = "0.8.2";
+    constexpr const char* kReleasePage =
+        "https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases";
+    constexpr const char* kAssetRoot =
+        "https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases/download/";
+    constexpr const wchar_t* kReleasePathRoot =
+        L"/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases/download/";
+
+    // Manifest status: 0 idle / 1 checking / 2 complete / 3 error
+    static std::atomic<int> status{0};
+    // Binary status: 0 idle / 1 downloading / 2 verified / 3 error / 4 closing game
+    static std::atomic<int> downloadStatus{0};
+    static std::atomic<std::uint64_t> downloadedBytes{0};
+    static std::atomic<std::uint64_t> totalBytes{0};
     static std::mutex resultMutex;
     static std::string latestClient;
     static std::string latestAPWorld;
+    static std::string latestChecksum;
+    static std::string latestUrl;
+    static std::uint64_t latestAssetSize = 0;
     static std::string message;
+    static std::string downloadMessage;
 
-    // Read only our fixed update manifest. No remote-supplied download paths or filenames.
-    static bool ReadManifest(std::string& out, std::string& error)
-    {
-        HINTERNET session = WinHttpOpen(L"SonicUnleashedArchipelagoUpdater/0.0.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!session) { error = "Cannot initialize HTTPS."; return false; }
-        WinHttpSetTimeouts(session, 5000, 5000, 8000, 8000);
-        HINTERNET connection = WinHttpConnect(session, L"raw.githubusercontent.com",
-            INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!connection) { WinHttpCloseHandle(session); error = "Cannot connect to GitHub."; return false; }
-        HINTERNET request = WinHttpOpenRequest(connection, L"GET",
-            L"/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/main/updates/manifest.json",
-            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-        bool ok = request && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr);
-        DWORD httpCode = 0, codeSize = sizeof(httpCode);
-        if (ok) ok = !!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &httpCode, &codeSize, WINHTTP_NO_HEADER_INDEX);
-        if (!ok || httpCode != 200)
-        {
-            error = httpCode == 404 ? "No public update manifest yet (repository is private?)."
-                : "Could not fetch GitHub update manifest.";
-            ok = false;
-        }
-        while (ok)
-        {
-            DWORD available = 0;
-            if (!WinHttpQueryDataAvailable(request, &available)) { ok = false; break; }
-            if (!available) break;
-            if (available > 65536 || out.size() + available > 65536) { ok = false; break; }
-            char buffer[4096];
-            while (available && ok)
-            {
-                DWORD read = 0;
-                const DWORD amount = (std::min)(available, DWORD(sizeof(buffer)));
-                if (!WinHttpReadData(request, buffer, amount, &read) || read == 0) { ok = false; break; }
-                out.append(buffer, read);
-                available -= read;
-            }
-        }
-        if (request) WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connection);
-        WinHttpCloseHandle(session);
-        if (!ok && error.empty()) error = "GitHub download interrupted.";
-        return ok;
-    }
-
-    static void StartCheck()
-    {
-        if (status.exchange(1) == 1) return;
-        std::thread([]()
-        {
-            std::string body, error, client, apworld;
-            bool ok = ReadManifest(body, error);
-            if (ok)
-            {
-                try
-                {
-                    auto j = nlohmann::json::parse(body);
-                    client = j.at("client_version").get<std::string>();
-                    apworld = j.at("apworld_version").get<std::string>();
-                    if (client.empty() || apworld.empty() || client.size() > 32 || apworld.size() > 32)
-                        throw std::runtime_error("invalid versions");
-                }
-                catch (...) { ok = false; error = "Invalid update manifest."; }
-            }
-            {
-                std::lock_guard<std::mutex> lock(resultMutex);
-                latestClient = client;
-                latestAPWorld = apworld;
-                message = error;
-            }
-            status.store(ok ? 2 : 3);
-        }).detach();
-    }
-
-    // AP_UPDATER_VERSION_UI_V2: parse strict major.minor.patch, reject malformed version strings.
     static bool ParseVersion(const std::string& text, unsigned int (&parts)[3])
     {
-        if (text.empty() || text.size() > 32) return false;
+        if (text.empty() || text.size() > 24) return false;
+        for (char c : text) if (!((c >= '0' && c <= '9') || c == '.')) return false;
         unsigned int a = 0, b = 0, c = 0;
         char trailing = '\0';
         if (std::sscanf(text.c_str(), "%u.%u.%u%c", &a, &b, &c, &trailing) != 3) return false;
@@ -1502,70 +1445,1024 @@ namespace APUpdateV1
         }
         return false;
     }
+    static bool IsExpectedAssetUrl(const std::string& url, const std::string& version)
+    {
+        unsigned int parts[3]{};
+        if (!ParseVersion(version, parts)) return false;
+        return url == std::string(kAssetRoot) + "V" + version + "/Sonic.X.Archipelago.V" + version + ".exe";
+    }
+    static std::filesystem::path StagedPath()
+    {
+        auto result = APSelfUpdate::CurrentExePath();
+        return result.empty() ? result : std::filesystem::path(result.wstring() + L".apupdate.new");
+    }
+
+    static bool ReadManifest(std::string& out, std::string& error)
+    {
+        HINTERNET session = WinHttpOpen(L"SonicUnleashedArchipelagoUpdater/0.8.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session) { error = "Cannot initialize HTTPS"; return false; }
+        WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
+        HINTERNET connection = WinHttpConnect(session, L"raw.githubusercontent.com",
+            INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!connection) { WinHttpCloseHandle(session); error = "Cannot connect to GitHub"; return false; }
+        HINTERNET request = WinHttpOpenRequest(connection, L"GET",
+            L"/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/main/updates/manifest.json",
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        bool ok = request && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr);
+        DWORD httpCode = 0, size = sizeof(httpCode);
+        if (ok) ok = !!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &httpCode, &size, WINHTTP_NO_HEADER_INDEX);
+        if (!ok || httpCode != 200)
+        {
+            error = httpCode == 404 ? "No public update manifest found" : "Could not fetch GitHub update manifest";
+            ok = false;
+        }
+        while (ok)
+        {
+            char buffer[4096];
+            DWORD read = 0;
+            if (!WinHttpReadData(request, buffer, sizeof(buffer), &read)) { ok = false; break; }
+            if (!read) break;
+            if (out.size() + read > 65536) { ok = false; break; }
+            out.append(buffer, read);
+        }
+        if (request) WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        if (!ok && error.empty()) error = "GitHub connection interrupted";
+        return ok;
+    }
+
+    static void StartCheck()
+    {
+        if (status.exchange(1) == 1) return;
+        downloadStatus.store(0);
+        {
+            std::lock_guard<std::mutex> lock(resultMutex);
+            downloadMessage.clear();
+        }
+        std::thread([]()
+        {
+            std::string body, error, client, apworld, sha, url;
+            std::uint64_t assetSize = 0;
+            bool ok = ReadManifest(body, error);
+            if (ok)
+            {
+                try
+                {
+                    auto j = nlohmann::json::parse(body);
+                    if (j.at("schema_version").get<int>() != 1)
+                        throw std::runtime_error("unsupported schema");
+                    client = j.at("client_version").get<std::string>();
+                    apworld = j.at("apworld_version").get<std::string>();
+                    unsigned int test[3]{};
+                    if (!ParseVersion(client, test) || !ParseVersion(apworld, test))
+                        throw std::runtime_error("invalid version");
+                    if (j.contains("client_sha256") && j["client_sha256"].is_string())
+                        sha = j["client_sha256"].get<std::string>();
+                    if (j.contains("client_download_url") && j["client_download_url"].is_string())
+                        url = j["client_download_url"].get<std::string>();
+                    if (j.contains("client_asset_size") && j["client_asset_size"].is_number_unsigned())
+                        assetSize = j["client_asset_size"].get<std::uint64_t>();
+                }
+                catch (...) { ok = false; error = "Invalid update manifest"; }
+            }
+            {
+                std::lock_guard<std::mutex> lock(resultMutex);
+                latestClient = client;
+                latestAPWorld = apworld;
+                latestChecksum = sha;
+                latestUrl = url;
+                latestAssetSize = assetSize;
+                message = error;
+            }
+            status.store(ok ? 2 : 3, std::memory_order_release);
+        }).detach();
+    }
+
+    // GitHub release asset download, streamed to the game EXE's directory.
+    // The asset path is reconstructed from the parsed version; no arbitrary URL is requested.
+    static bool DownloadBinary(const std::string& version,
+        const std::string& expectedSha, std::uint64_t expectedSize, std::string& error)
+    {
+        const auto destination = StagedPath();
+        if (destination.empty()) { error = "Cannot locate the game EXE"; return false; }
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        HINTERNET session = WinHttpOpen(L"SonicUnleashedArchipelagoUpdater/0.8.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session) { error = "Cannot initialize secure download"; return false; }
+        WinHttpSetTimeouts(session, 10000, 10000, 20000, 20000);
+        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+        WinHttpSetOption(session, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+        HINTERNET connection = WinHttpConnect(session, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+        const std::wstring path = std::wstring(kReleasePathRoot) + L"V" +
+            std::wstring(version.begin(), version.end()) + L"/Sonic.X.Archipelago.V" +
+            std::wstring(version.begin(), version.end()) + L".exe";
+        HINTERNET request = connection ? WinHttpOpenRequest(connection, L"GET", path.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+        bool ok = request && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr);
+        DWORD code = 0, codeSize = sizeof(code);
+        if (ok) ok = !!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &code, &codeSize, WINHTTP_NO_HEADER_INDEX);
+        if (!ok || code != 200)
+        {
+            error = code == 404 ? "GitHub release EXE not found" : "Release download failed";
+            ok = false;
+        }
+        std::uint64_t advertised = 0;
+        if (ok)
+        {
+            wchar_t lengthText[64]{};
+            DWORD lengthSize = sizeof(lengthText);
+            if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH,
+                WINHTTP_HEADER_NAME_BY_INDEX, lengthText, &lengthSize, WINHTTP_NO_HEADER_INDEX))
+            {
+                wchar_t* end = nullptr;
+                advertised = std::wcstoull(lengthText, &end, 10);
+                if (!end || *end != L'\0') advertised = 0;
+            }
+        }
+        constexpr std::uint64_t kLimit = 1024ull * 1024ull * 1024ull; // 1 GiB safety cap.
+        if (advertised > kLimit || expectedSize > kLimit) { ok = false; error = "Update exceeds safety size limit"; }
+        if (ok && advertised && expectedSize && advertised != expectedSize)
+            { ok = false; error = "Download size does not match the manifest"; }
+        totalBytes.store(advertised);
+        downloadedBytes.store(0);
+        std::ofstream file;
+        if (ok)
+        {
+            file.open(destination, std::ios::binary | std::ios::trunc);
+            if (!file) { ok = false; error = "Cannot write beside game EXE"; }
+        }
+        std::uint64_t total = 0;
+        while (ok)
+        {
+            char buffer[65536];
+            DWORD read = 0;
+            if (!WinHttpReadData(request, buffer, sizeof(buffer), &read))
+            {
+                ok = false; error = "Download interrupted"; break;
+            }
+            if (!read) break;
+            total += read;
+            if (total > kLimit || (advertised && total > advertised))
+            {
+                ok = false; error = "Downloaded file has invalid size"; break;
+            }
+            file.write(buffer, read);
+            if (!file) { ok = false; error = "Disk write failed"; break; }
+            downloadedBytes.store(total);
+        }
+        file.close();
+        if (request) WinHttpCloseHandle(request);
+        if (connection) WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        if (ok && total == 0) { ok = false; error = "Empty update file"; }
+        if (ok && expectedSize && total != expectedSize)
+            { ok = false; error = "Incomplete or incorrect update size"; }
+        if (ok && advertised && total != advertised)
+            { ok = false; error = "Incomplete update download"; }
+        if (ok)
+        {
+            std::string actual;
+            ok = APSelfUpdate::Sha256File(destination, actual) &&
+                APSelfUpdate::LowerAscii(actual) == APSelfUpdate::LowerAscii(expectedSha);
+            if (!ok) error = "SHA-256 verification failed (update not installed)";
+        }
+        if (!ok) std::filesystem::remove(destination, ec);
+        return ok;
+    }
+
+    static void StartDownload(const std::string& version, const std::string& sha, std::uint64_t expectedSize)
+    {
+        if (downloadStatus.load() == 1 || downloadStatus.load() == 4) return;
+        downloadStatus.store(1);
+        std::thread([version, sha, expectedSize]()
+        {
+            std::string error;
+            const bool ok = DownloadBinary(version, sha, expectedSize, error);
+            {
+                std::lock_guard<std::mutex> lock(resultMutex);
+                downloadMessage = error;
+            }
+            downloadStatus.store(ok ? 2 : 3, std::memory_order_release);
+        }).detach();
+    }
+
     static void DrawControls()
     {
         ImGui::Text("Installed Client Version: %s Beta", kClientVersion);
         ImGui::Separator();
-        ImGui::BeginDisabled(status.load() == 1);
+        const bool busy = status.load() == 1 || downloadStatus.load() == 1 || downloadStatus.load() == 4;
+        ImGui::BeginDisabled(busy);
         if (ImGui::Button("CHECK FOR UPDATES", ImVec2(-1, 40))) StartCheck();
-        // AP_F8_USABILITY_V4: chrome / glossy look matching other menu buttons.
+        // Existing F8 glossy border retained.
         {
             const ImVec2 p = ImGui::GetItemRectMin();
             const ImVec2 s = ImGui::GetItemRectSize();
             const ImVec2 bottom(p.x + s.x, p.y + s.y);
             ImDrawList* draw = ImGui::GetWindowDrawList();
-            draw->AddRectFilled(
-                ImVec2(p.x + 5.0f, p.y + 4.0f),
-                ImVec2(bottom.x - 5.0f, p.y + s.y * 0.38f),
-                IM_COL32(180, 225, 255, 55), 10.0f);
-            draw->AddRect(
-                ImVec2(p.x + 1.0f, p.y + 1.0f),
-                ImVec2(bottom.x - 1.0f, bottom.y - 1.0f),
-                IM_COL32(160, 215, 245, 235), 13.0f, 0, 2.5f);
-            draw->AddRect(
-                ImVec2(p.x + 4.0f, p.y + 4.0f),
-                ImVec2(bottom.x - 4.0f, bottom.y - 4.0f),
-                IM_COL32(15, 55, 105, 210), 10.0f, 0, 1.5f);
-            draw->AddLine(
-                ImVec2(p.x + 17.0f, p.y + 2.0f),
-                ImVec2(bottom.x - 17.0f, p.y + 2.0f),
-                IM_COL32(225, 245, 255, 170), 1.5f);
+            draw->AddRectFilled(ImVec2(p.x + 5.0f, p.y + 4.0f),
+                ImVec2(bottom.x - 5.0f, p.y + s.y * 0.38f), IM_COL32(180,225,255,55), 10.0f);
+            draw->AddRect(ImVec2(p.x + 1.0f,p.y + 1.0f), ImVec2(bottom.x - 1.0f,bottom.y - 1.0f),
+                IM_COL32(160,215,245,235), 13.0f, 0, 2.5f);
+            draw->AddRect(ImVec2(p.x + 4.0f,p.y + 4.0f), ImVec2(bottom.x - 4.0f,bottom.y - 4.0f),
+                IM_COL32(15,55,105,210), 10.0f, 0, 1.5f);
+            draw->AddLine(ImVec2(p.x + 17.0f,p.y + 2.0f), ImVec2(bottom.x - 17.0f,p.y + 2.0f),
+                IM_COL32(225,245,255,170), 1.5f);
         }
         ImGui::EndDisabled();
         const int state = status.load();
         if (state == 1) ImGui::TextUnformatted("Checking GitHub...");
-        if (state == 2)
-        {
-            std::lock_guard<std::mutex> lock(resultMutex);
-            // AP_UPDATER_VERSION_UI_V2: only newer semver versions trigger update actions.
-            const bool clientNew = IsNewerVersion(latestClient, kClientVersion);
-            const bool worldNew = IsNewerVersion(latestAPWorld, kAPWorldVersion);
-            ImGui::Text("Client: %s  /  latest: %s", kClientVersion, latestClient.c_str());
-            ImGui::Text("APWorld: %s  /  latest: %s", kAPWorldVersion, latestAPWorld.c_str());
-            if (!clientNew && !worldNew)
-                ImGui::TextUnformatted("You're up to date!");
-            if (clientNew)
-            {
-                ImGui::TextWrapped("New client version available on GitHub.");
-                if (ImGui::Button("VIEW CLIENT UPDATE", ImVec2(-1, 38)))
-                    SDL_OpenURL(kReleasePage);
-            }
-            if (worldNew)
-            {
-                ImGui::TextWrapped("New APWorld available. Download it manually from GitHub.");
-                if (ImGui::Button("VIEW APWORLD DOWNLOAD", ImVec2(-1, 38)))
-                    SDL_OpenURL(kReleasePage);
-            }
-        }
         if (state == 3)
         {
             std::lock_guard<std::mutex> lock(resultMutex);
             ImGui::TextWrapped("Update check: %s", message.c_str());
         }
+        if (state == 2)
+        {
+            std::lock_guard<std::mutex> lock(resultMutex);
+            const bool clientNew = IsNewerVersion(latestClient, kClientVersion);
+            const bool worldNew = IsNewerVersion(latestAPWorld, kAPWorldVersion);
+            const bool hasTrustedRelease =
+                IsExpectedAssetUrl(latestUrl, latestClient) &&
+                APSelfUpdate::IsHexSha256(latestChecksum);
+            ImGui::Text("Client: %s / latest: %s", kClientVersion, latestClient.c_str());
+            ImGui::Text("APWorld: %s / latest: %s", kAPWorldVersion, latestAPWorld.c_str());
+            if (!clientNew && !worldNew) ImGui::TextUnformatted("You're up to date!");
+            if (clientNew && !hasTrustedRelease)
+            {
+                ImGui::TextWrapped("New game version found. Automatic download is not published yet.");
+                if (ImGui::Button("VIEW GAME RELEASE", ImVec2(-1, 34))) SDL_OpenURL(kReleasePage);
+            }
+            if (clientNew && hasTrustedRelease)
+            {
+                const int d = downloadStatus.load();
+                if (d == 0 || d == 3)
+                {
+                    if (ImGui::Button("DOWNLOAD GAME UPDATE", ImVec2(-1, 38)))
+                        StartDownload(latestClient, latestChecksum, latestAssetSize);
+                }
+                if (d == 1)
+                {
+                    const auto count = downloadedBytes.load();
+                    const auto total = totalBytes.load();
+                    const float progress = total ?
+                        std::clamp(static_cast<float>(count) / static_cast<float>(total), 0.0f, 1.0f) : 0.0f;
+                    ImGui::ProgressBar(progress, ImVec2(-1, 16), total ? nullptr : "Downloading...");
+                    ImGui::Text("Downloaded: %.1f MB%s", count / (1024.0 * 1024.0),
+                        total ? "" : " (total unknown)");
+                }
+                if (d == 3) ImGui::TextWrapped("Download failed: %s", downloadMessage.c_str());
+                if (d == 2)
+                {
+                    ImGui::TextWrapped("Verified update ready. Close game to install and restart.");
+                    if (ImGui::Button("INSTALL UPDATE AND RESTART", ImVec2(-1, 40)))
+                    {
+                        std::string error;
+                        if (APSelfUpdate::LaunchHelper(StagedPath(), latestChecksum, error))
+                        {
+                            downloadStatus.store(4);
+                            SDL_Event event{};
+                            event.type = SDL_QUIT;
+                            SDL_PushEvent(&event);
+                        }
+                        else downloadMessage = error;
+                    }
+                    if (!downloadMessage.empty()) ImGui::TextWrapped("%s", downloadMessage.c_str());
+                }
+                if (d == 4) ImGui::TextUnformatted("Closing game for update...");
+            }
+            if (worldNew)
+            {
+                ImGui::TextWrapped("New APWorld! Download and install it manually from GitHub.");
+                if (ImGui::Button("VIEW APWORLD DOWNLOAD", ImVec2(-1, 38)))
+                    SDL_OpenURL(kReleasePage);
+            }
+        }
     }
 }
 #endif
-// AP_UPDATER_V1_END
+// AP_UPDATER_V4_END
+// AP_RING_ROULETTE_V2_SKIN_BEGIN - cosmetic-only changes to V1 game rewards.
+// PNG and WAV bytes are compiled into the game executable.
+// No separate RingRoulette folder is needed.
+extern bool g_apConnectorVisible;
+namespace APRouletteSkin
+{
+    constexpr int kSymbolCount = 8;
+    constexpr int kSoundCount = 5;
+    enum SoundId { Start = 0, Tick = 1, Stop = 2, Win = 3, Jackpot = 4 };
+    static std::unique_ptr<GuestTexture> artwork;
+    static std::unique_ptr<GuestTexture> readyArt;
+    static std::unique_ptr<GuestTexture> icons[kSymbolCount];
+    static bool artworkAttempted = false;
+    static bool settingsLoaded = false;
+    static bool soundEnabled = true;
+    static int volume = 55;
+    // V0.8.2: movable/resizable HUD; percentages of the available safe screen area.
+    static int hudSizePercent = 100;
+    static int hudXPercent = 100;
+    static int hudYPercent = 0;
+    static SDL_AudioDeviceID soundDevice = 0;
+    static bool soundDeviceFailed = false;
+    struct SoundData { bool attempted = false; std::vector<Uint8> pcm; };
+    static SoundData sounds[kSoundCount];
+
+    static std::filesystem::path SettingsPath()
+    {
+        return APRingRoulette::SettingsPath().parent_path() / "ap_ring_roulette_skin.json";
+    }
+
+    static void ReadSettings()
+    {
+        if (settingsLoaded) return;
+        settingsLoaded = true;
+        try
+        {
+            std::ifstream file(SettingsPath());
+            if (!file) return;
+            const auto data = nlohmann::json::parse(file, nullptr, false);
+            if (!data.is_object()) return;
+            if (data.contains("sound_enabled") && data["sound_enabled"].is_boolean())
+                soundEnabled = data["sound_enabled"].get<bool>();
+            if (data.contains("volume") && data["volume"].is_number_integer())
+                volume = std::clamp(data["volume"].get<int>(), 0, 100);
+            if (data.contains("hud_size_percent") && data["hud_size_percent"].is_number_integer())
+                hudSizePercent = std::clamp(data["hud_size_percent"].get<int>(), 50, 175);
+            if (data.contains("hud_x_percent") && data["hud_x_percent"].is_number_integer())
+                hudXPercent = std::clamp(data["hud_x_percent"].get<int>(), 0, 100);
+            if (data.contains("hud_y_percent") && data["hud_y_percent"].is_number_integer())
+                hudYPercent = std::clamp(data["hud_y_percent"].get<int>(), 0, 100);
+        }
+        catch (...) { /* Bad/missing cosmetic settings should never affect gameplay. */ }
+    }
+
+    static void SaveSettings()
+    {
+        try
+        {
+            auto path = SettingsPath();
+            std::filesystem::create_directories(path.parent_path());
+            std::ofstream file(path, std::ios::trunc);
+            if (file) file << nlohmann::json({
+                {"sound_enabled",soundEnabled}, {"volume",volume},
+                {"hud_size_percent",hudSizePercent},
+                {"hud_x_percent",hudXPercent}, {"hud_y_percent",hudYPercent}
+            }).dump(2) << '\n';
+        }
+        catch (...) { /* Cosmetic preference save is optional. */ }
+    }
+
+    static std::unique_ptr<GuestTexture> ReadImage(APRouletteEmbedded::Asset asset)
+    {
+        if (!asset.bytes || !asset.size) return nullptr;
+        return LoadTexture(asset.bytes, asset.size);
+    }
+
+    static void LoadArtwork()
+    {
+        if (artworkAttempted) return;
+        artworkAttempted = true;
+        try
+        {
+            artwork = ReadImage(APRouletteEmbedded::frame);
+            readyArt = ReadImage(APRouletteEmbedded::ready);
+            for (int i = 0; i < kSymbolCount; ++i)
+                icons[i] = ReadImage(APRouletteEmbedded::symbols[i]);
+            if (!artwork) LOGN("AP ROULETTE EMBEDDED: frame decoding failed; text fallback active");
+            else LOGN("AP ROULETTE EMBEDDED: artwork loaded from executable");
+        }
+        catch (...) { LOGN("AP ROULETTE EMBEDDED: image loading failed; text fallback active"); }
+    }
+
+    static bool HasFrame() { LoadArtwork(); return artwork != nullptr; }
+    static GuestTexture* Icon(APRingRoulette::Prize prize)
+    {
+        const int index = static_cast<int>(prize) - 1;
+        return (index >= 0 && index < kSymbolCount) ? icons[index].get() : nullptr;
+    }
+
+    static bool StartSoundDevice()
+    {
+        if (soundDevice) return true;
+        if (soundDeviceFailed) return false;
+        SDL_AudioSpec desired{};
+        desired.freq = 44100;
+        desired.format = AUDIO_F32SYS;
+        desired.channels = 2;
+        desired.samples = 1024;
+        desired.callback = nullptr;
+        soundDevice = SDL_OpenAudioDevice(nullptr, 0, &desired, nullptr, 0);
+        if (!soundDevice)
+        {
+            soundDeviceFailed = true;
+            LOGFN("AP ROULETTE V2: sound disabled (SDL): {}", SDL_GetError());
+            return false;
+        }
+        SDL_PauseAudioDevice(soundDevice, 0);
+        return true;
+    }
+
+    static bool LoadSound(int id)
+    {
+        auto& slot = sounds[id];
+        if (slot.attempted) return !slot.pcm.empty();
+        slot.attempted = true;
+        try
+        {
+            SDL_AudioSpec inputSpec{};
+            Uint8* wavData = nullptr;
+            Uint32 wavLength = 0;
+            const auto& data = APRouletteEmbedded::sounds[id];
+            if (!data.bytes || data.size == 0 || data.size > static_cast<size_t>((std::numeric_limits<int>::max)())) return false;
+            SDL_RWops* rw = SDL_RWFromConstMem(data.bytes, static_cast<int>(data.size));
+            if (!rw) return false;
+            // SDL frees RWops after decoding; embedded data remains compiled into EXE.
+            if (!SDL_LoadWAV_RW(rw, 1, &inputSpec, &wavData, &wavLength)) return false;
+            SDL_AudioCVT cvt{};
+            const int needConversion = SDL_BuildAudioCVT(&cvt, inputSpec.format,
+                inputSpec.channels, inputSpec.freq, AUDIO_F32SYS, 2, 44100);
+            if (needConversion < 0)
+            {
+                SDL_FreeWAV(wavData);
+                return false;
+            }
+            if (!needConversion)
+                slot.pcm.assign(wavData, wavData + wavLength);
+            else
+            {
+                cvt.len = static_cast<int>(wavLength);
+                cvt.buf = static_cast<Uint8*>(SDL_malloc(static_cast<size_t>(cvt.len) * cvt.len_mult));
+                if (cvt.buf)
+                {
+                    std::memcpy(cvt.buf, wavData, wavLength);
+                    if (SDL_ConvertAudio(&cvt) == 0)
+                        slot.pcm.assign(cvt.buf, cvt.buf + cvt.len_cvt);
+                    SDL_free(cvt.buf);
+                }
+            }
+            SDL_FreeWAV(wavData);
+        }
+        catch (...) { slot.pcm.clear(); }
+        return !slot.pcm.empty();
+    }
+
+    static void Play(SoundId id)
+    {
+        ReadSettings();
+        if (!soundEnabled || volume <= 0 || !LoadSound(static_cast<int>(id)) || !StartSoundDevice()) return;
+        const auto& pcm = sounds[static_cast<int>(id)].pcm;
+        // Do not accumulate effects when the game/OS audio device stalls.
+        if (SDL_GetQueuedAudioSize(soundDevice) > 44100u * 2u * sizeof(float) / 2u)
+            SDL_ClearQueuedAudio(soundDevice);
+        std::vector<Uint8> mixed(pcm.size(), 0);
+        SDL_MixAudioFormat(mixed.data(), pcm.data(), AUDIO_F32SYS,
+                           static_cast<Uint32>(pcm.size()),
+                           std::clamp(volume * SDL_MIX_MAXVOLUME / 100, 0, SDL_MIX_MAXVOLUME));
+        SDL_QueueAudio(soundDevice, mixed.data(), static_cast<Uint32>(mixed.size()));
+    }
+
+    static void Centered(ImDrawList* draw, const char* label, const ImVec2& center,
+                         float fontSize, ImU32 color)
+    {
+        ImFont* font = ImGui::GetFont();
+        const ImVec2 measured = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, label);
+        const ImVec2 p(center.x - measured.x * .5f, center.y - measured.y * .5f);
+        draw->AddText(font, fontSize, ImVec2(p.x+1.5f,p.y+2.0f), IM_COL32(0,6,24,240), label);
+        draw->AddText(font, fontSize, p, color, label);
+    }
+
+    static void DrawSymbol(ImDrawList* draw, APRingRoulette::Prize prize,
+                           ImVec2 min, ImVec2 max)
+    {
+        if (auto* tex = Icon(prize))
+        {
+            draw->AddImage(tex,min,max);
+            return;
+        }
+        // Safe fallback for custom artwork not installed yet.
+        const int id = static_cast<int>(prize);
+        const char* txt = (id == 4) ? "HOTDOG" : (id == 6) ? "-1:00" : "?";
+        Centered(draw,txt,ImVec2((min.x+max.x)*.5f,(min.y+max.y)*.5f),
+                 (max.x-min.x)*.17f,IM_COL32(255,227,129,255));
+    }
+}
+
+namespace APRouletteUI
+{
+    static SDL_GameController* pad = nullptr;
+    static bool lastButton = false;
+    static bool lastKeyboard = false;
+    static double spinBegin = 0.0;
+    static double resultUntil = 0.0;
+    static int lastStoredProgress = -1;
+    static double lastSaveAt = 0.0;
+    static double lastTickAt = 0.0;
+    static unsigned reelStopMask = 0;
+    static APRingRoulette::Prize visualPrize = APRingRoulette::Prize::None;
+    static const char* kButtonLabels[15] = {
+        "A / Cross", "B / Circle", "X / Square", "Y / Triangle",
+        "Back / Share", "Guide", "Start / Options", "L3", "R3",
+        "Left Shoulder (LB)", "Right Shoulder (RB)",
+        "D-Pad Up", "D-Pad Down", "D-Pad Left", "D-Pad Right"
+    };
+
+    static APRingRoulette::Prize Roll()
+    {
+        // Original V1 odds, unchanged. 777 = 1 in 1000 spins (0.1%).
+        static std::mt19937 rng(std::random_device{}());
+        const int slot = std::uniform_int_distribution<int>(0, 999)(rng);
+        if (slot < 250) return APRingRoulette::Prize::Ring1;       // 25%
+        if (slot < 450) return APRingRoulette::Prize::Life1;       // 20%
+        if (slot < 650) return APRingRoulette::Prize::Ring100;     // 20%
+        if (slot < 800) return APRingRoulette::Prize::Hotdog;      // 15%
+        if (slot < 900) return APRingRoulette::Prize::Life3;       // 10%
+        if (slot < 969) return APRingRoulette::Prize::Minute60;    // 6.9%
+        if (slot < 999) return APRingRoulette::Prize::Score50000;  // 3%
+        return APRingRoulette::Prize::Jackpot777;                  // 0.1%
+    }
+
+    static void PollInput()
+    {
+        APRingRoulette::Load();
+        APRouletteSkin::ReadSettings();
+        // A interrupted/reinitialized UI must not leave spinning=true forever.
+        // No reward was chosen in a recoverable frame, so retain all 300 Rings.
+        if (APRingRoulette::spinning.load(std::memory_order_acquire) && spinBegin <= 0.0)
+        {
+            APRingRoulette::spinning.store(false, std::memory_order_release);
+            APRingRoulette::Save();
+            LOGFN("[RING ROULETTE] Recovered orphaned spin; 300-ring charge preserved");
+        }
+        if (pad && !SDL_GameControllerGetAttached(pad)) {
+            SDL_GameControllerClose(pad);
+            pad = nullptr;
+            lastButton = false;
+        }
+        if (!pad) {
+            for (int i = 0; i < SDL_NumJoysticks(); ++i) {
+                if (SDL_IsGameController(i)) {
+                    pad = SDL_GameControllerOpen(i);
+                    if (pad) break;
+                }
+            }
+        }
+        const int chosen = APRingRoulette::button.load();
+        const bool buttonPressed = pad && chosen >= 0 && chosen < 15 &&
+            SDL_GameControllerGetButton(pad, static_cast<SDL_GameControllerButton>(chosen));
+        const bool keyboardPressed = SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_F9] != 0;
+        const bool freshPress = (buttonPressed && !lastButton) ||
+                                (keyboardPressed && !lastKeyboard);
+        lastButton = buttonPressed;
+        lastKeyboard = keyboardPressed;
+        if (freshPress && !::g_apConnectorVisible && APRingRoulette::StartSpin())
+        {
+            // Pick the exact same weighted reward at the beginning so reels can
+            // visually settle one after another. The game still awards it only
+            // AFTER the existing 2.6-second spin completes.
+            visualPrize = Roll();
+            spinBegin = ImGui::GetTime();
+            lastTickAt = spinBegin;
+            reelStopMask = 0;
+            APRouletteSkin::Play(APRouletteSkin::Start);
+        }
+
+        const double now = ImGui::GetTime();
+        if (APRingRoulette::spinning.load() && spinBegin > 0.0)
+        {
+            const double elapsed = now - spinBegin;
+            if (elapsed < 1.8 && now - lastTickAt >= .115)
+            {
+                lastTickAt = now;
+                APRouletteSkin::Play(APRouletteSkin::Tick);
+            }
+            const double stops[3] = {1.80, 2.16, 2.55};
+            for (unsigned i = 0; i < 3; ++i)
+                if (elapsed >= stops[i] && !(reelStopMask & (1u << i)))
+                {
+                    reelStopMask |= (1u << i);
+                    APRouletteSkin::Play(APRouletteSkin::Stop);
+                }
+            if (elapsed >= 2.6)
+            {
+                const auto prize = visualPrize;
+                if (prize == APRingRoulette::Prize::Minute60)
+                {
+                    // Original V1 safeguard: time reward is not hooked yet;
+                    // keep 300 collected Rings, and show unavailable message.
+                    APRingRoulette::spinning.store(false);
+                    APRingRoulette::lastPrize.store(static_cast<int>(prize));
+                }
+                else APRingRoulette::SetPending(prize);
+                resultUntil = now + 5.0;
+                spinBegin = 0.0;
+                APRingRoulette::Save();
+                APRouletteSkin::Play(prize == APRingRoulette::Prize::Jackpot777
+                    ? APRouletteSkin::Jackpot :
+                    prize == APRingRoulette::Prize::Minute60
+                    ? APRouletteSkin::Stop : APRouletteSkin::Win);
+            }
+        }
+        // V1 save behavior remains intact.
+        const int p = APRingRoulette::progress.load();
+        if (p != lastStoredProgress && now - lastSaveAt >= 3.0) {
+            lastStoredProgress = p;
+            lastSaveAt = now;
+            APRingRoulette::Save();
+        }
+    }
+
+    // AP_ROULETTE_COUNTER_ARCADE_V5: self-contained vector arcade digits.
+    // No font file or texture folder is needed; each glyph scales with the HUD.
+    static void DrawArcadeCounter(ImDrawList* draw, const ImVec2& sheetMin,
+                                  float scale, int ringCount)
+    {
+        // Segment layout: top, upper-right, lower-right, bottom,
+        // lower-left, upper-left, center. Traces remain dim when unlit.
+        static constexpr unsigned char kSegments[10] = {
+            0x3f, 0x06, 0x5b, 0x4f, 0x66,
+            0x6d, 0x7d, 0x07, 0x7f, 0x6f
+        };
+        const std::string digits = std::to_string(std::clamp(ringCount, 0, 300)) + "/300";
+        constexpr float digitWidth = 39.f, digitHeight = 55.f;
+        constexpr float slashWidth = 26.f, gap = 12.f;
+        const float textWidth = (static_cast<float>(digits.size()) - 1.f) * gap +
+            digitWidth * static_cast<float>(digits.size() - 1) + slashWidth;
+        float x = 296.f - textWidth * .5f;
+        constexpr float y = 238.f;
+        const ImVec2 origin = sheetMin;
+        const auto pos = [&](float logicalX, float logicalY) {
+            return ImVec2(origin.x + logicalX * scale,
+                          origin.y + logicalY * scale);
+        };
+        const float tick = static_cast<float>(ImGui::GetTime());
+        const float shimmer = .80f + .20f * std::sin(tick * 2.8f);
+        const ImU32 unlit = IM_COL32(23, 54, 91, 110);
+        const ImU32 glow = IM_COL32(51, 177, 252, static_cast<int>(38.f * shimmer));
+        const ImU32 blue = IM_COL32(126, 218, 255, 255);
+        const ImU32 white = IM_COL32(231, 249, 255, 255);
+        const ImU32 gold = IM_COL32(249, 202, 102, 255);
+        const ImU32 goldGlow = IM_COL32(246, 159, 45, 34);
+
+        for (size_t c = 0; c < digits.size(); ++c)
+        {
+            const char ch = digits[c];
+            if (ch == '/')
+            {
+                // The slash is drawn rather than borrowed from the default UI font.
+                const ImVec2 a = pos(x + 3.f, y + digitHeight - 2.f);
+                const ImVec2 b = pos(x + slashWidth - 3.f, y + 2.f);
+                draw->AddLine(a, b, IM_COL32(50, 131, 221, 47), 13.f * scale);
+                draw->AddLine(a, b, IM_COL32(154, 200, 246, 245), 4.2f * scale);
+                x += slashWidth + gap;
+                continue;
+            }
+            if (ch < '0' || ch > '9') continue;
+            const bool isCurrent = c < digits.find('/');
+            const ImU32 lit = isCurrent ? blue : gold;
+            const ImU32 halo = isCurrent ? glow : goldGlow;
+            const unsigned char bits = kSegments[ch - '0'];
+            // Endpoints of the seven segments, normalized to a 39 x 55 cell.
+            const float segment[7][4] = {
+                { 7.f,  5.f, 32.f,  5.f},
+                {34.f,  9.f, 34.f, 25.f},
+                {34.f, 30.f, 34.f, 46.f},
+                { 7.f, 50.f, 32.f, 50.f},
+                { 5.f, 30.f,  5.f, 46.f},
+                { 5.f,  9.f,  5.f, 25.f},
+                { 7.f, 27.5f,32.f, 27.5f}
+            };
+            for (int part = 0; part < 7; ++part)
+            {
+                const ImVec2 a = pos(x + segment[part][0], y + segment[part][1]);
+                const ImVec2 b = pos(x + segment[part][2], y + segment[part][3]);
+                const bool active = (bits & (1u << part)) != 0;
+                if (active)
+                {
+                    draw->AddLine(a, b, halo, 15.f * scale);
+                    draw->AddLine(a, b, lit, 7.0f * scale);
+                    draw->AddLine(a, b, isCurrent ? white : IM_COL32(255, 235, 170, 245),
+                                  2.0f * scale);
+                }
+                else draw->AddLine(a, b, unlit, 5.f * scale);
+            }
+            x += digitWidth + gap;
+        }
+    }
+
+    // AP_RING_ROULETTE_V3_TOP_RIGHT_BEGIN
+    // Cabinet is always the compact top-right HUD; no extra center-screen popup.
+    // Gameplay and weighted prize selection are unchanged from V2.
+    static void DrawOverlay()
+    {
+        if (!APRingRoulette::enabled.load()) return;
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        if (!viewport) return;
+        ImDrawList* draw = ImGui::GetForegroundDrawList();
+        if (!draw) return;
+
+        // Responsive 642 x 425 Blender PNG, anchored to upper-right with margin.
+        // On small resolutions, hide while F8 is open to keep the settings usable.
+        if (::g_apConnectorVisible && viewport->Size.x < 1120.f) return;
+        const float baselineScale = std::clamp((std::min)(viewport->Size.x / 2500.f,
+                                                         viewport->Size.y / 1450.f), .39f, .88f);
+        // Respect user size, while keeping the entire cabinet inside the viewport.
+        const float desiredScale = baselineScale * (APRouletteSkin::hudSizePercent / 100.f);
+        const float fitScale = (std::min)(viewport->Size.x / 686.f, viewport->Size.y / 485.f);
+        const float scale = (std::min)(desiredScale, fitScale);
+        const float marginX = (std::min)(22.f * scale, viewport->Size.x * .02f);
+        const float marginY = (std::min)(25.f * scale, viewport->Size.y * .02f);
+        const ImVec2 sheetSize(642.f*scale, 425.f*scale);
+        const float availableX = (std::max)(0.f, viewport->Size.x - sheetSize.x - 2.f*marginX);
+        const float availableY = (std::max)(0.f, viewport->Size.y - sheetSize.y - 2.f*marginY);
+        const ImVec2 sheetMin(viewport->Pos.x + marginX +
+                                  availableX * APRouletteSkin::hudXPercent / 100.f,
+                              viewport->Pos.y + marginY +
+                                  availableY * APRouletteSkin::hudYPercent / 100.f);
+        const ImVec2 sheetMax(sheetMin.x+sheetSize.x, sheetMin.y+sheetSize.y);
+        const auto pt = [&](float x, float y) -> ImVec2 {
+            return ImVec2(sheetMin.x+x*scale, sheetMin.y+y*scale);
+        };
+        const auto rect = [&](float x1,float y1,float x2,float y2,ImU32 color,float r=0.f) {
+            draw->AddRectFilled(pt(x1,y1),pt(x2,y2),color,r*scale);
+        };
+        const auto label = [&](const char* text,float x,float y,float size,ImU32 color) {
+            APRouletteSkin::Centered(draw,text,pt(x,y),size*scale,color);
+        };
+        const double now = ImGui::GetTime();
+        const bool spinning = APRingRoulette::spinning.load();
+        const bool displayingResult = !spinning && now < resultUntil &&
+                                     APRingRoulette::lastPrize.load() != 0;
+        const bool charged = APRingRoulette::progress.load() >= APRingRoulette::kRequiredRings;
+        const bool ready = APRingRoulette::Ready();
+        const bool pendingReward = APRingRoulette::pending.load() != 0;
+        const auto reward = spinning ? visualPrize :
+            static_cast<APRingRoulette::Prize>(APRingRoulette::lastPrize.load());
+        const bool jackpot = displayingResult && reward == APRingRoulette::Prize::Jackpot777;
+
+        // Custom PNG is always the HUD (not just shown during a spin).
+        if (!APRouletteSkin::HasFrame())
+        {
+            // Graceful fallback if embedded image decoding fails.
+            rect(24,132,600,415,IM_COL32(6,16,42,233),16.f);
+            draw->AddRect(pt(24,132),pt(600,415),IM_COL32(92,172,255,255),12.f*scale,0,2.f*scale);
+            label("SONIC SLOT MACHINE",311,182,32.f,IM_COL32(255,181,99,255));
+        }
+        else
+        {
+            // Shadow under the cabinet only; the Blender artwork stays intact.
+            draw->AddRectFilled(pt(7,153),pt(592,422),IM_COL32(0,4,22,65),16.f*scale);
+            draw->AddImage(APRouletteSkin::artwork.get(),sheetMin,sheetMax);
+        }
+
+        // All custom details are strictly inside the dark cabinet screen.
+        // This screen is approx x=27..566, y=147..409 on the supplied PNG.
+        const float centerX = 296.f;
+        const float pulse = .5f + .5f*std::sin(static_cast<float>(now*4.4));
+        if (!spinning && !displayingResult && !charged)
+        {
+            const int progress = std::clamp(APRingRoulette::progress.load(),0,300);
+            const float fill = progress / 300.f;
+            // AP_ROULETTE_COUNTER_ARCADE_V5: cyan/gold vector display,
+            // subtle illuminated bezel and a slimmer ring-charge bar.
+            label("RING CHARGE",centerX,206,27.f,IM_COL32(255,213,141,255));
+            rect(73,224,522,303,IM_COL32(0,9,30,216),12.f);
+            draw->AddRect(pt(73,224),pt(522,303),
+                IM_COL32(74,154,232,170),12.f*scale,0,1.8f*scale);
+            draw->AddLine(pt(94,227),pt(500,227),
+                IM_COL32(165,220,255,65),1.8f*scale);
+            DrawArcadeCounter(draw,sheetMin,scale,progress);
+            label("RINGS",centerX,317,15.f,IM_COL32(165,211,251,245));
+            // Chrome / cobalt charge bar (same progress as before).
+            rect(78,335,514,363,IM_COL32(0,6,20,236),10.f);
+            draw->AddRect(pt(78,335),pt(514,363),
+                IM_COL32(93,177,255,225),10.f*scale,0,2.1f*scale);
+            rect(85,341,507,357,IM_COL32(19,44,81,255),6.f);
+            if (fill > 0.f)
+            {
+                const float endX = 85.f + 422.f * fill;
+                rect(85,341,endX,357,IM_COL32(31,166,246,255),6.f);
+                if (fill >= .06f)
+                    draw->AddLine(pt(91,344),pt(endX-4.f,344),
+                        IM_COL32(196,242,255,188),2.5f*scale);
+                draw->AddCircleFilled(pt(endX,349),5.5f*scale,
+                    IM_COL32(211,250,255,245));
+            }
+            label("COLLECT RINGS TO UNLOCK",centerX,388,18.f,
+                  IM_COL32(171,211,246,245));
+            return;
+        }
+
+        if (!spinning && !displayingResult && pendingReward)
+        {
+            label("REWARD PENDING",centerX,264,34.f,IM_COL32(255,213,119,255));
+            // Rewards are applied by safe game-thread hooks, not the ImGui renderer.
+            // Explain precisely why another spin cannot start yet.
+            const auto queued = static_cast<APRingRoulette::Prize>(APRingRoulette::pending.load());
+            const char* instruction = queued == APRingRoulette::Prize::Hotdog
+                ? "HOTDOG DELIVERY PENDING"
+                : (queued == APRingRoulette::Prize::Life1 ||
+                   queued == APRingRoulette::Prize::Life3 ||
+                   queued == APRingRoulette::Prize::Jackpot777)
+                ? "WAITING FOR LIFE UPDATE" : "WAITING FOR GAME UPDATE";
+            label(instruction,centerX,307,16.f,IM_COL32(179,221,255,255));
+            const std::string ringCharge = "NEXT CHARGE: " +
+                std::to_string(std::clamp(APRingRoulette::progress.load(), 0, 300)) + "/300";
+            label(ringCharge.c_str(),centerX,358,18.f,IM_COL32(145,230,255,255));
+            return;
+        }
+
+        // READY, SPIN and RESULT share the same three aligned arcade reels.
+        // At READY these are a teaser set, not a preselected jackpot outcome.
+        const double elapsed=spinning ? (std::max)(0.0,now-spinBegin) : 3.0;
+        for (int i=0; i<3; ++i)
+        {
+            const float x=58.f+164.f*i, y=199.f;
+            const ImVec2 cellMin=pt(x,y), cellMax=pt(x+143.f,y+137.f);
+            draw->AddRectFilled(cellMin,cellMax,IM_COL32(3,12,33,253),12.f*scale);
+            const ImU32 border = jackpot ? IM_COL32(255,218,107,255) :
+                ready ? IM_COL32(111,200,255,255) : IM_COL32(60,138,218,242);
+            draw->AddRect(cellMin,cellMax,border,12.f*scale,0,(ready?3.0f:2.0f)*scale);
+            rect(x+8,y+8,x+135,y+14,IM_COL32(202,234,255,85),3.f);
+            draw->PushClipRect(pt(x+7,y+7),pt(x+136,y+130),true);
+            const bool stopped = !spinning || elapsed >= (i==0 ? 1.80 : i==1 ? 2.16 : 2.55);
+            if (stopped)
+            {
+                const APRingRoulette::Prize symbol = (!spinning && !displayingResult) ?
+                    static_cast<APRingRoulette::Prize>(i==0?1:i==1?3:2) : reward;
+                const float glow = jackpot ? 1.f+.05f*std::sin(static_cast<float>(now*11.f)) : 1.f;
+                const float side=108.f*scale*glow;
+                const ImVec2 middle=pt(x+71.5f,y+68.f);
+                APRouletteSkin::DrawSymbol(draw,symbol,
+                    ImVec2(middle.x-side*.5f,middle.y-side*.5f),
+                    ImVec2(middle.x+side*.5f,middle.y+side*.5f));
+            }
+            else
+            {
+                const double frame = elapsed*(16.0-2.0*i) + i*2.37;
+                const int index=static_cast<int>(std::floor(frame));
+                const float fraction=static_cast<float>(frame-std::floor(frame));
+                for (int k=-1;k<=1;++k)
+                {
+                    const int symbol=((index+k)%APRouletteSkin::kSymbolCount+
+                        APRouletteSkin::kSymbolCount)%APRouletteSkin::kSymbolCount;
+                    const ImVec2 middle=pt(x+71.5f,y+68.f+(k-fraction)*119.f);
+                    APRouletteSkin::DrawSymbol(draw,
+                        static_cast<APRingRoulette::Prize>(symbol+1),
+                        ImVec2(middle.x-54.f*scale,middle.y-54.f*scale),
+                        ImVec2(middle.x+54.f*scale,middle.y+54.f*scale));
+                }
+            }
+            draw->PopClipRect();
+        }
+
+        if (!spinning && !displayingResult)
+        {
+            // Bold golden READY with a soft orange halo; no extra external font needed.
+            const ImU32 halo=IM_COL32(238,126,22,static_cast<int>(65+65*pulse));
+            if (!APRouletteSkin::readyArt)
+            {
+                const ImVec2 p=pt(centerX,369);
+                for (int n=0;n<8;++n)
+                {
+                    const float a=n*6.2831853f/8.f;
+                    APRouletteSkin::Centered(draw,"READY",
+                        ImVec2(p.x+3.f*scale*std::cos(a),p.y+3.f*scale*std::sin(a)),
+                        45.f*scale,halo);
+                }
+            }
+            label("READY",centerX,369,45.f,IM_COL32(255,224,119,255));
+            const char* tip = APRingRoulette::inAct.load() ? "PRESS R3 / F9 TO SPIN" :
+                "ENTER A STAGE TO SPIN";
+            label(tip,centerX,402,17.f,IM_COL32(194,232,255,255));
+            return;
+        }
+
+        if (spinning)
+        {
+            label("SPINNING...",centerX,379,30.f,IM_COL32(143,220,255,255));
+        }
+        else if (reward == APRingRoulette::Prize::Minute60)
+        {
+            label("TIME BONUS UNAVAILABLE",centerX,376,21.f,IM_COL32(255,194,116,255));
+            label("300 RINGS REFUNDED",centerX,402,17.f,IM_COL32(213,237,255,255));
+        }
+        else
+        {
+            label(APRingRoulette::PrizeName(reward),centerX,379,
+                  jackpot?23.f:24.f,jackpot?IM_COL32(255,226,94,255):IM_COL32(164,231,255,255));
+        }
+        if (jackpot)
+        {
+            for (int i=0;i<15;++i)
+            {
+                const float a=i*6.2831853f/15.f+static_cast<float>(now*.55);
+                const float r=158.f+11.f*std::sin(static_cast<float>(now*4.f+i));
+                draw->AddCircleFilled(pt(centerX+std::cos(a)*r,
+                                         265.f+std::sin(a)*r*.55f),
+                    (2.5f+1.1f*std::sin(static_cast<float>(now*7.f+i)))*scale,
+                    IM_COL32(255,215,90,215));
+            }
+        }
+    }
+    // AP_RING_ROULETTE_V3_TOP_RIGHT_END
+
+    static void DrawSettings()
+    {
+        APRingRoulette::Load();
+        APRouletteSkin::ReadSettings();
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(.98f,.69f,.42f,1.f),"SONIC SLOT MACHINE  |  RING ROULETTE");
+        bool e = APRingRoulette::enabled.load();
+        if (ImGui::Checkbox("Enable Ring Roulette##APRouletteEnable",&e)) {
+            APRingRoulette::enabled.store(e);
+            APRingRoulette::Save();
+        }
+        ImGui::Text("Collected Rings: %d / 300",APRingRoulette::progress.load());
+        ImGui::ProgressBar(APRingRoulette::progress.load()/300.f,ImVec2(-1,10),"");
+        int b=APRingRoulette::button.load();
+        if (ImGui::Combo("Controller button##APRouletteButton",&b,kButtonLabels,15)) {
+            APRingRoulette::button.store(b);
+            lastButton=true;
+            APRingRoulette::Save();
+        }
+        if (ImGui::Checkbox("Slot machine sound effects##APRouletteSFX",&APRouletteSkin::soundEnabled))
+        {
+            if (!APRouletteSkin::soundEnabled && APRouletteSkin::soundDevice)
+                SDL_ClearQueuedAudio(APRouletteSkin::soundDevice);
+            APRouletteSkin::SaveSettings();
+        }
+        if (ImGui::SliderInt("SFX volume##APRouletteVolume",&APRouletteSkin::volume,0,100,"%d%%"))
+            APRouletteSkin::SaveSettings();
+        ImGui::Separator();
+        ImGui::Text("Slot machine HUD size and position");
+        if (ImGui::SliderInt("HUD size##APRouletteHudSize", &APRouletteSkin::hudSizePercent, 50, 175, "%d%%"))
+            APRouletteSkin::SaveSettings();
+        if (ImGui::SliderInt("Horizontal position##APRouletteHudX", &APRouletteSkin::hudXPercent, 0, 100, "%d%%"))
+            APRouletteSkin::SaveSettings();
+        if (ImGui::SliderInt("Vertical position##APRouletteHudY", &APRouletteSkin::hudYPercent, 0, 100, "%d%%"))
+            APRouletteSkin::SaveSettings();
+        if (ImGui::Button("Reset HUD placement##APRouletteHudDefault"))
+        {
+            APRouletteSkin::hudSizePercent = 100;
+            APRouletteSkin::hudXPercent = 100;
+            APRouletteSkin::hudYPercent = 0;
+            APRouletteSkin::SaveSettings();
+        }
+        ImGui::TextDisabled("Settings are saved automatically.");
+        ImGui::TextDisabled("300 Rings required to start");
+        ImGui::TextDisabled("777 Jackpot: 0.1%% chance");
+        // Recovery controls for interrupted sessions. No guest-memory writes.
+        // Do not silently discard pending rewards.
+        if (!APRingRoulette::spinning.load() && APRingRoulette::pending.load() == 0)
+        {
+            if (ImGui::Button("Reset roulette charge##APRouletteReset"))
+                ImGui::OpenPopup("Confirm roulette reset##APRoulette");
+            if (ImGui::BeginPopupModal("Confirm roulette reset##APRoulette", nullptr,
+                                      ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                ImGui::TextWrapped("Reset collected Rings to 0 / 300? This cannot be undone.");
+                if (ImGui::Button("Confirm reset##APRoulette"))
+                {
+                    APRingRoulette::progress.store(0, std::memory_order_release);
+                    APRingRoulette::lastPrize.store(0, std::memory_order_release);
+                    APRingRoulette::Save();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel##APRoulette")) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        }
+        if (APRingRoulette::progress.load() >= 300 && !APRingRoulette::inAct.load())
+            ImGui::TextDisabled("Charge saved. Enter a playable Act to spin.");
+        const auto queuedPrize = static_cast<APRingRoulette::Prize>(
+            APRingRoulette::pending.load(std::memory_order_acquire));
+        if (queuedPrize != APRingRoulette::Prize::None)
+        {
+            ImGui::TextColored(ImVec4(.98f,.69f,.42f,1.f),
+                "Unclaimed prize: %s", APRingRoulette::PrizeName(queuedPrize));
+            if (queuedPrize == APRingRoulette::Prize::Hotdog)
+                ImGui::TextWrapped("Hotdog delivery is attempted automatically in an Act when a verified game manager is available. The inventory menu remains a safe fallback.");
+            else if (queuedPrize == APRingRoulette::Prize::Life1 ||
+                     queuedPrize == APRingRoulette::Prize::Life3 ||
+                     queuedPrize == APRingRoulette::Prize::Jackpot777)
+                ImGui::TextWrapped("Waiting for the verified life-manager hook. The prize will stay queued, not discarded.");
+            else
+                ImGui::TextWrapped("The reward is queued until its game-thread hook applies it. No further spin can start until then.");
+        }
+    }
+}
+// AP_RING_ROULETTE_V2_SKIN_END
+#include "ap_multiplayer_overlay.h" // AP_MULTIWORLD_HUD_V082
+
 static void CreateImGuiBackend()
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -2769,13 +3666,14 @@ static void DrawAPMedalsHud()
         draw->AddImage(g_apMedalsAtlas.get(), ImVec2(x,y), ImVec2(x+iconSize,y+iconSize), uv0, uv1);
     }
     // AP_MEDALS_TEXT_V3: floating metallic silver text, no background.
-    const std::string medalText = fmt::format("{} / 370", medalCount);
+    const int medalTarget = APClient::GetMedalGoalTarget();
+    const std::string medalText = fmt::format("{} / {}", medalCount, medalTarget);
     ImFont* medalFont = ImGui::GetFont();
     const float medalFontSize = 33.0f * scale;
     const ImVec2 medalPos(x + iconSize + 12.0f * scale, y + 27.0f * scale);
     const ImVec2 medalExtent = medalFont->CalcTextSizeA(medalFontSize, FLT_MAX, 0.0f, medalText.c_str());
-    const ImU32 silverTop = medalCount >= 370 ? IM_COL32(255, 242, 174, 255) : IM_COL32(250, 253, 255, 255);
-    const ImU32 silverBottom = medalCount >= 370 ? IM_COL32(219, 154, 39, 255) : IM_COL32(133, 164, 193, 255);
+    const ImU32 silverTop = medalCount >= medalTarget ? IM_COL32(255, 242, 174, 255) : IM_COL32(250, 253, 255, 255);
+    const ImU32 silverBottom = medalCount >= medalTarget ? IM_COL32(219, 154, 39, 255) : IM_COL32(133, 164, 193, 255);
     // A small dark outline improves legibility without a panel.
     const float outline = 1.4f * scale;
     draw->AddText(medalFont, medalFontSize, ImVec2(medalPos.x - outline, medalPos.y), IM_COL32(6, 13, 24, 240), medalText.c_str());
@@ -3036,6 +3934,9 @@ static void DrawImGui()
     }
 
     ImGui::NewFrame();
+
+    APRouletteUI::PollInput();
+    APRouletteUI::DrawOverlay();
 
     ResetImGuiCallbacks();
 
@@ -4058,6 +4959,12 @@ static void DrawImGui()
             ImGui::Spacing();
             // AP_MEDAL_RADAR_F8_V1_END
 
+            // AP_RING_ROULETTE_V1_F8_BEGIN
+            APRouletteUI::DrawSettings();
+            APMultiplayerOverlay::DrawSettings(); // AP_MULTIWORLD_HUD_V082_F8
+            ImGui::Spacing();
+            // AP_RING_ROULETTE_V1_F8_END
+
             // Ouvrir le sous-menu Custom Music.
             if (apCustomMusicVisible)
             {
@@ -4871,6 +5778,7 @@ if (ImGui::BeginTabItem("BOSSES"))
 
     APMedalRadarAudio::Tick(); // AP_MEDAL_RADAR_AUDIO_V1
     DrawAPMedalsHud();
+    APMultiplayerOverlay::DrawOverlay(); // AP_MULTIWORLD_HUD_V082_RENDER
     DrawFPS();
     DrawProfiler();
     ImGui::Render();

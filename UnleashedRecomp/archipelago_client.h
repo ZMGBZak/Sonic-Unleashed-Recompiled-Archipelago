@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace APClient
 {
@@ -13,11 +15,30 @@ namespace APClient
         Disconnecting
     };
 
+    // AP_MULTIWORLD_HUD_V082: per-room live exchanges (never ReceivedItems replay).
+    struct MultiplayerEvent
+    {
+        std::int64_t itemId = -1;
+        int sourceSlot = -1;
+        int destinationSlot = -1;
+        bool isProgression = false;
+        bool receivedLocally = false;
+        std::string sourceName;
+        std::string destinationName;
+        std::string itemName;
+    };
+    std::vector<MultiplayerEvent> DrainMultiplayerEvents();
+    std::string ResolveMultiplayerItemName(const MultiplayerEvent& event);
+    int GetMedalGoalCount();
+    int GetMedalGoalTarget();
+
     void Start();
     void Disconnect();
     ConnectionState GetConnectionState();
 
     // Ajoute un check ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â  la file d'attente rÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©seau.
+    // True for pending/saved or server-confirmed checks of the active AP slot.
+    bool IsLocationChecked(std::int64_t locationId);
     void QueueLocationCheck(std::int64_t locationId);
 
     // Enregistre une mort locale pour l'envoi Death Link.

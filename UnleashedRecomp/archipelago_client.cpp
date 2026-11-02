@@ -1,6 +1,7 @@
 
 #include "stdafx.h"
 #include "archipelago_client.h"
+#include "patches/ap_medal_display_names.h" // AP_MEDAL_CHECK_NAMES_V082
 #include "os/logger.h"
 
 #ifdef _WIN32
@@ -26,6 +27,15 @@ namespace
     using json = nlohmann::json;
 
     std::mutex apMutex;
+// AP_MULTIWORLD_HUD_V082_BEGIN: protected by the existing apMutex.
+std::vector<APClient::MultiplayerEvent> apMultiplayerQueue;
+std::unordered_map<int, std::string> apMultiPlayerNames;
+std::unordered_map<int, std::string> apMultiPlayerGames;
+std::unordered_map<std::string, std::unordered_map<std::int64_t, std::string>> apMultiItemNames;
+std::vector<std::string> apMultiWorldGames;
+int apMultiOwnSlot = -1;
+int apMedalGoalTarget = 338;
+// AP_MULTIWORLD_HUD_V082_END
     std::condition_variable apWake;
 // AP_GOAL_V1_BEGIN - protected by apMutex
 int apSelectedGoal = -1; // 0 Dark Gaia, 1 Egg Dragoon, 2 medals
@@ -135,6 +145,8 @@ std::uint32_t apPendingIncomingDeathLinks = 0;
 
     // Masque partage entre thread reseau et thread jeu. Protege par apMutex.
     std::uint8_t apReceivedShoes = 0;
+    // AP_SHOES_SYNC_V082: synchronisation autorisee apres l'inventaire complet.
+    bool apShoeInventoryReady = false;
 
     // AP Progressive Medals
     constexpr std::int64_t kSunMedalItemId = 88001001;
@@ -2617,10 +2629,12 @@ bool apSuperClawsStateLoadedSuccessfully = false;
 
             if (apConfirmed.insert(id).second)
             {
-                std::printf(
-                    "AP CHECK CONFIRMED: %lld\n",
-                    static_cast<long long>(id)
-                );
+                if (const char* medalName = AP_MedalDisplayName(id))
+                    std::printf("AP CHECK CONFIRMED: %lld (%s)\n",
+                        static_cast<long long>(id), medalName);
+                else
+                    std::printf("AP CHECK CONFIRMED: %lld\n",
+                        static_cast<long long>(id));
             }
 
             apPending.erase(id);
@@ -2631,13 +2645,13 @@ bool apSuperClawsStateLoadedSuccessfully = false;
         const std::int64_t bossGoalLocation =
             apSelectedGoal == 0 ? 88000666LL :
             apSelectedGoal == 1 ? 88000661LL : -1LL;
-        // AP_MEDALS_GOAL_V1: all 370 server-confirmed medal locations.
+        // AP_ENTRANCE_SHARED_V1: all 338 unique server-confirmed medal locations.
         if (apSelectedGoal == 2 && !apGoalSent)
         {
             int medalCount = 0;
             for (const auto medalId : apConfirmed)
                 if (medalId >= 88000001LL && medalId <= 88000370LL) ++medalCount;
-            if (medalCount == 370) { apGoalPending = true; apWake.notify_all(); }
+            if (medalCount >= apMedalGoalTarget) { apGoalPending = true; apWake.notify_all(); }
         }
         if (bossGoalLocation >= 0 &&
             apConfirmed.contains(bossGoalLocation) && !apGoalSent)
@@ -2797,6 +2811,108 @@ bool apSuperClawsStateLoadedSuccessfully = false;
             std::fflush(stdout);
         }
     }
+// AP_MULTIWORLD_HUD_V082_NETWORK_HELPERS
+    std::string BoundedName(const std::string& text, std::size_t limit=120)
+    {
+        if (text.size() <= limit) return text;
+        std::size_t n = limit - 3;
+        while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) --n;
+        return text.substr(0, n) + "...";
+    }
+
+    void RememberSlotNames(const json& packet)
+    {
+        if (packet.contains("players") && packet["players"].is_array())
+        {
+            for (const auto& player : packet["players"])
+            {
+                if (!player.is_object() || !player.contains("slot") ||
+                    !player["slot"].is_number_integer()) continue;
+                const int id = player["slot"].get<int>();
+                if (player.contains("alias") && player["alias"].is_string())
+                    apMultiPlayerNames[id] = BoundedName(player["alias"].get<std::string>(), 65);
+                else if (player.contains("name") && player["name"].is_string())
+                    apMultiPlayerNames[id] = BoundedName(player["name"].get<std::string>(), 65);
+            }
+        }
+        if (packet.contains("slot_info") && packet["slot_info"].is_object())
+        {
+            for (auto it = packet["slot_info"].begin(); it != packet["slot_info"].end(); ++it)
+            {
+                if (!it.value().is_object()) continue;
+                int id = 0;
+                try { id = std::stoi(it.key()); } catch (...) { continue; }
+                if (it.value().contains("name") && it.value()["name"].is_string() &&
+                    !apMultiPlayerNames.contains(id))
+                    apMultiPlayerNames[id] = BoundedName(it.value()["name"].get<std::string>(), 65);
+                if (it.value().contains("game") && it.value()["game"].is_string())
+                {
+                    const std::string game = it.value()["game"].get<std::string>();
+                    apMultiPlayerGames[id] = game;
+                    if (!game.empty() && std::find(apMultiWorldGames.begin(), apMultiWorldGames.end(), game) == apMultiWorldGames.end())
+                        apMultiWorldGames.push_back(game);
+                }
+            }
+        }
+    }
+
+    void ReceiveDataPackage(const json& packet)
+    {
+        if (!packet.contains("data") || !packet["data"].is_object()) return;
+        const auto& data = packet["data"];
+        if (!data.contains("games") || !data["games"].is_object()) return;
+        std::lock_guard<std::mutex> lock(apMutex);
+        for (auto it = data["games"].begin(); it != data["games"].end(); ++it)
+        {
+            const auto& gameData = it.value();
+            if (!gameData.is_object() || !gameData.contains("item_name_to_id") ||
+                !gameData["item_name_to_id"].is_object()) continue;
+            auto& names = apMultiItemNames[it.key()];
+            for (auto item = gameData["item_name_to_id"].begin(); item != gameData["item_name_to_id"].end(); ++item)
+            {
+                if (item.value().is_number_integer())
+                    names[item.value().get<std::int64_t>()] = BoundedName(item.key(), 145);
+            }
+        }
+    }
+
+    void ReceiveItemAnnouncement(const json& packet)
+    {
+        if (!packet.contains("item") || !packet["item"].is_object() ||
+            !packet.contains("receiving") || !packet["receiving"].is_number_integer()) return;
+        const auto& info = packet["item"];
+        if (!info.contains("item") || !info["item"].is_number_integer() ||
+            !info.contains("player") || !info["player"].is_number_integer()) return;
+        APClient::MultiplayerEvent event;
+        event.itemId = info["item"].get<std::int64_t>();
+        event.sourceSlot = info["player"].get<int>();
+        event.destinationSlot = packet["receiving"].get<int>();
+        event.isProgression = info.contains("flags") && info["flags"].is_number_integer() &&
+            ((info["flags"].get<int>() & 1) != 0);
+        // PrintJSON data can sometimes supply pre-resolved item names.
+        // IDs remain fallback; official DataPackage resolves names across games.
+        if (packet.contains("data") && packet["data"].is_array())
+        {
+            for (const auto& part : packet["data"])
+            {
+                if (!part.is_object() || !part.contains("type") || !part["type"].is_string() ||
+                    part["type"].get<std::string>() != "item_name" ||
+                    !part.contains("text") || !part["text"].is_string()) continue;
+                event.itemName = BoundedName(part["text"].get<std::string>(), 145);
+                break;
+            }
+        }
+        std::lock_guard<std::mutex> lock(apMutex);
+        const auto source = apMultiPlayerNames.find(event.sourceSlot);
+        const auto dest = apMultiPlayerNames.find(event.destinationSlot);
+        event.sourceName = source != apMultiPlayerNames.end() ? source->second : "Player " + std::to_string(event.sourceSlot);
+        event.destinationName = dest != apMultiPlayerNames.end() ? dest->second : "Player " + std::to_string(event.destinationSlot);
+        event.receivedLocally = (apMultiOwnSlot >= 0 && event.destinationSlot == apMultiOwnSlot);
+        apMultiplayerQueue.emplace_back(std::move(event));
+        if (apMultiplayerQueue.size() > 96) apMultiplayerQueue.erase(apMultiplayerQueue.begin(), apMultiplayerQueue.begin() + 32);
+    }
+// AP_MULTIWORLD_HUD_V082_NETWORK_HELPERS_END
+
     void HandleMessage(
         const std::string& text,
         HINTERNET socket,
@@ -2828,6 +2944,13 @@ bool apSuperClawsStateLoadedSuccessfully = false;
 
                     // Chaque partie Archipelago possede son propre historique.
                     apSeedName = packet.value("seed_name", std::string(""));
+                    apMultiplayerQueue.clear();
+                    apMultiPlayerNames.clear();
+                    apMultiPlayerGames.clear();
+                    apMultiItemNames.clear();
+                    apMultiWorldGames.clear();
+                    apMultiOwnSlot = -1;
+                    apMedalGoalTarget = 338;
 
                     // Invalider les anciennes reservations QTE a chaque RoomInfo.
                     ++apQteOfDoomGeneration;
@@ -3030,6 +3153,12 @@ LoadPowerShieldState();
 
                 {
                     std::lock_guard<std::mutex> lock(apMutex);
+                    apMultiOwnSlot = packet["slot"].get<int>();
+                    RememberSlotNames(packet);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(apMutex);
                     // Restaurer les checks seulement apres authentification.
                     if (!LoadCheckState())
                     {
@@ -3065,6 +3194,15 @@ LoadPowerShieldState();
                                 apIncludeDlc = option.get<int>() != 0;
                         }
                     }
+                    // Goal total stays aligned with slot data. Older rooms default to 338.
+                    apMedalGoalTarget = 338;
+                    if (packet.contains("slot_data") && packet["slot_data"].is_object() &&
+                        packet["slot_data"].contains("medal_goal_target") &&
+                        packet["slot_data"]["medal_goal_target"].is_number_integer())
+                    {
+                        const int expected = packet["slot_data"]["medal_goal_target"].get<int>();
+                        if (expected > 0 && expected <= 370) apMedalGoalTarget = expected;
+                    }
                     // Rank threshold sent by the APWorld: 0=D, 1=C, 2=B, 3=A.
                     apRequiredRankForAllChecks = 3;
                     if (packet.contains("slot_data") && packet["slot_data"].is_object())
@@ -3083,6 +3221,9 @@ LoadPowerShieldState();
                     std::printf("AP DLC CHECKS: %s\n", apIncludeDlc ? "ON" : "OFF");
                     std::printf("AP GOAL SELECTED: %d\n", apSelectedGoal);
                     // AP_GOAL_V1_END
+                    // AP_SHOES_SYNC_V082: nouvelle room => inventaire a reconstruire.
+                    apReceivedShoes = 0;
+                    apShoeInventoryReady = false;
                     apAuthenticated = true;
                     apConnectionState = APConnectionState::Connected;
                     apSent.clear();
@@ -3104,9 +3245,33 @@ LoadPowerShieldState();
                 }
 
                 apWake.notify_all();
+                // Resolve item names for every game in this room. No guessing IDs.
+                // A failure affects labels only; the Archipelago client keeps working.
+                json games = json::array();
+                {
+                    std::lock_guard<std::mutex> lock(apMutex);
+                    for (const auto& game : apMultiWorldGames) games.push_back(game);
+                }
+                if (!games.empty())
+                    SendJson(socket, json::array({{{"cmd", "GetDataPackage"}, {"games", games}}}));
+            }
+            else if (cmd == "DataPackage")
+            {
+                ReceiveDataPackage(packet);
+            }
+            else if (cmd == "PrintJSON")
+            {
+                // All players' exchanges; progression chime is limited to local recipient.
+                const std::string messageType = packet.value("type", std::string(""));
+                if (authenticated && (messageType == "ItemSend" || messageType == "ItemCheat"))
+                    ReceiveItemAnnouncement(packet);
             }
             else if (cmd == "RoomUpdate")
             {
+                {
+                    std::lock_guard<std::mutex> lock(apMutex);
+                    RememberSlotNames(packet);
+                }
                 if (packet.contains("checked_locations"))
                     ConfirmLocations(packet["checked_locations"]);
             }
@@ -3140,7 +3305,8 @@ LoadPowerShieldState();
                         }
                     }
 
-                    if (isDeathLink)
+                    if (isDeathLink &&
+                        dataIt->value("source", std::string("Unknown")) != Config::ArchipelagoSlot.Value)
                     {
                         const std::string source =
                             dataIt->value("source", std::string("Unknown"));
@@ -3711,6 +3877,12 @@ if (itemId == kRingWipeTrapItemId)
                             static_cast<long long>(index), amount, apPendingRings);
                     }
                 }
+                // AP_SHOES_SYNC_V082: l'index 0 inclut le debut de l'historique.
+                if (startIndex == 0)
+                {
+                    std::lock_guard<std::mutex> lock(apMutex);
+                    apShoeInventoryReady = true;
+                }
                 std::fflush(stdout);
             }
         }
@@ -3871,7 +4043,7 @@ if (itemId == kRingWipeTrapItemId)
 
                 message.append(buffer, bytesRead);
 
-                if (message.size() > 1024 * 1024)
+                if (message.size() > 16 * 1024 * 1024)
                 {
                     Print("AP: Message too large");
                     break;
@@ -3935,6 +4107,17 @@ if (itemId == kRingWipeTrapItemId)
     }
 }
 
+// AP_SHOES_SYNC_V082: lecture atomique pour le thread de jeu.
+// Pas d'ecriture de sauvegarde sans authentification + historique d'items.
+bool AP_TryGetReceivedShoeMask(std::uint8_t* outMask)
+{
+    if (!outMask) return false;
+    std::lock_guard<std::mutex> lock(apMutex);
+    if (!apAuthenticated || !apShoeInventoryReady || apDisconnectRequested)
+        return false;
+    *outMask = apReceivedShoes;
+    return true;
+}
 // Appelee uniquement par le thread jeu : ne touche jamais a la RAM ici.
 std::uint8_t AP_GetReceivedShoeMask()
 {
@@ -4937,6 +5120,15 @@ bool APClient::ConsumeIncomingDeathLink()
     --apPendingIncomingDeathLinks;
     return true;
 }
+// AP_MEDAL_RADAR_PERSIST_V1 - queried by gameplay radar; no mutations.
+bool APClient::IsLocationChecked(std::int64_t locationId)
+{
+    std::lock_guard<std::mutex> lock(apMutex);
+    if (!apAuthenticated || apDisconnectRequested || !apCheckStateLoadedSuccessfully)
+        return false;
+    return apConfirmed.contains(locationId) || apPending.contains(locationId);
+}
+
 void APClient::QueueLocationCheck(std::int64_t locationId)
 {
     std::size_t queuedCount = 0;
@@ -4991,8 +5183,12 @@ void APClient::QueueLocationCheck(std::int64_t locationId)
         queuedCount = newChecks.size();
     }
 
-    std::printf("AP CHECK QUEUED: %lld (%zu new checks)\n",
-        static_cast<long long>(locationId), queuedCount);
+    if (const char* medalName = AP_MedalDisplayName(locationId))
+        std::printf("AP CHECK QUEUED: %lld (%s, %zu new checks)\n",
+            static_cast<long long>(locationId), medalName, queuedCount);
+    else
+        std::printf("AP CHECK QUEUED: %lld (%zu new checks)\n",
+            static_cast<long long>(locationId), queuedCount);
     std::fflush(stdout);
     apWake.notify_all();
 }
@@ -5040,6 +5236,44 @@ APClient::ConnectionState APClient::GetConnectionState()
     default:
         return ConnectionState::Disconnected;
     }
+}
+
+// AP_MULTIWORLD_HUD_V082: UI thread drains a bounded queue, never blocks network I/O.
+std::vector<APClient::MultiplayerEvent> APClient::DrainMultiplayerEvents()
+{
+    std::lock_guard<std::mutex> lock(apMutex);
+    std::vector<MultiplayerEvent> result;
+    result.swap(apMultiplayerQueue);
+    return result;
+}
+
+std::string APClient::ResolveMultiplayerItemName(const MultiplayerEvent& event)
+{
+    if (!event.itemName.empty()) return event.itemName;
+    std::lock_guard<std::mutex> lock(apMutex);
+    const auto game = apMultiPlayerGames.find(event.destinationSlot);
+    if (game != apMultiPlayerGames.end())
+    {
+        const auto items = apMultiItemNames.find(game->second);
+        if (items != apMultiItemNames.end())
+        {
+            const auto found = items->second.find(event.itemId);
+            if (found != items->second.end()) return found->second;
+        }
+    }
+    // AP's own IDs can be named immediately, even before DataPackage arrives.
+    if (event.itemId == 88001001LL) return "Sun Medal";
+    if (event.itemId == 88001002LL) return "Moon Medal";
+    if (event.itemId == 88001004LL) return "Stomping Shoes";
+    if (event.itemId == 88001005LL) return "Wall Jump Shoes";
+    if (event.itemId == 88001006LL) return "Air Boost Shoes";
+    if (event.itemId == 88001007LL) return "Light Speed Dash Shoes";
+    return "Item #" + std::to_string(event.itemId);
+}
+int APClient::GetMedalGoalTarget()
+{
+    std::lock_guard<std::mutex> lock(apMutex);
+    return apMedalGoalTarget;
 }
 
 // AP_MEDALS_HUD_V1: confirmed medal checks, not received medal items.
@@ -5120,6 +5354,14 @@ void APClient::CancelSuperClaws()
 }
 
 #else
+// AP_MULTIWORLD_HUD_V082: non-Windows build fallback.
+std::vector<APClient::MultiplayerEvent> APClient::DrainMultiplayerEvents() { return {}; }
+std::string APClient::ResolveMultiplayerItemName(const MultiplayerEvent& event)
+{
+    return !event.itemName.empty() ? event.itemName : "Item #" + std::to_string(event.itemId);
+}
+int APClient::GetMedalGoalTarget() { return 338; }
+
 bool APClient::ConsumeIncomingDeathLink()
 {
     return false;
@@ -5215,6 +5457,12 @@ std::uint32_t APClient::GetSunMedalBonus()
 std::uint32_t APClient::GetMoonMedalBonus()
 {
     return 0;
+}
+
+bool AP_TryGetReceivedShoeMask(std::uint8_t* outMask)
+{
+    if (outMask) *outMask = 0;
+    return false; // AP_SHOES_SYNC_V082: version sans client AP
 }
 
 std::uint8_t AP_GetReceivedShoeMask()
@@ -5385,6 +5633,12 @@ void APClient::ConfirmLifeBonusApplied()
 
 void APClient::QueueDeathLink()
 {
+}
+
+// AP_MEDAL_RADAR_PERSIST_V1 - non-Windows stub.
+bool APClient::IsLocationChecked(std::int64_t)
+{
+    return false;
 }
 
 void APClient::QueueLocationCheck(std::int64_t)

@@ -1,3 +1,4 @@
+#include "ap_ring_roulette.h" // AP_RING_ROULETTE_V1
 #include <api/SWA.h>
 #include <archipelago_client.h>
 #include <os/logger.h>
@@ -5,6 +6,8 @@
 #include <user/achievement_manager.h>
 #include <user/persistent_storage_manager.h>
 #include <user/config.h>
+#include <atomic>
+#include <cstdio>
 
 void AchievementManagerUnlockMidAsmHook(PPCRegister& id)
 {
@@ -46,15 +49,32 @@ bool DisableDLCIconMidAsmHook()
     return Config::DisableDLCIcon;
 }
 
+// AP_WEREHOG_BATTLE_STATE_DIAGNOSTIC_V1
+// Diagnostic only: observes the RAW value before the game's existing
+// battle-music suppression logic alters r11.u8. No sound behavior changed.
 void WerehogBattleMusicMidAsmHook(PPCRegister& r11)
 {
-    if (Config::BattleTheme)
-        return;
+    const unsigned rawState = static_cast<unsigned>(r11.u8);
 
-    // Swap CStateBattle for CStateNormal.
-    if (r11.u8 == 4)
+    // Original game/mod behavior: leave this untouched.
+    if (!Config::BattleTheme && r11.u8 == 4)
         r11.u8 = 3;
+
+    // Log raw state changes only, not every update/frame.
+    // A rawState of 4 is the candidate battle music state; verify in-game.
+    static std::atomic<int> lastRawState{-1};
+    const int previous = lastRawState.exchange(
+        static_cast<int>(rawState), std::memory_order_relaxed);
+    if (previous != static_cast<int>(rawState))
+    {
+        std::printf(
+            "[AP BATTLE DIAG] raw=%u effective=%u battle_theme=%d\n",
+            rawState,
+            static_cast<unsigned>(r11.u8),
+            Config::BattleTheme ? 1 : 0);
+    }
 }
+// END AP_WEREHOG_BATTLE_STATE_DIAGNOSTIC_V1
 
 bool UseAlternateTitleMidAsmHook()
 {
@@ -223,6 +243,26 @@ void APMenuInventoryDebugMidAsmHook(PPCRegister& r3, PPCRegister& r4)
 {
     if (r3.u32 == 0 || r4.u32 != 0)
         return;
+
+    // Ring Roulette: award a local Hotdog without using the AP network queue.
+    // The verified native inventory hook is only available when this menu is active.
+    if (APRingRoulette::Wants(APRingRoulette::Prize::Hotdog))
+    {
+        constexpr std::uint32_t kHotdogNativeId = 111u;
+        const std::uint32_t before = GuestToHostFunction<std::uint32_t>(
+            sub_82519C38, r3.u32, kHotdogNativeId);
+        if (before < 99u)
+        {
+            GuestToHostFunction<void>(sub_8251B810, r3.u32, kHotdogNativeId, 1);
+            const std::uint32_t after = GuestToHostFunction<std::uint32_t>(
+                sub_82519C38, r3.u32, kHotdogNativeId);
+            if (after > before)
+            {
+                APRingRoulette::Finish(APRingRoulette::Prize::Hotdog);
+                printf("[RING ROULETTE] Hotdog granted: %u -> %u\n", before, after);
+            }
+        }
+    }
 
     // Distribuer tous les consommables AP disponibles.
     // Limite de securite pour eviter une boucle infinie.

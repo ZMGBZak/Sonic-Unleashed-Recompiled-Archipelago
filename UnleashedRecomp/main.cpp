@@ -1,3 +1,4 @@
+#include <os/ap_update_helper.h> // AP_UPDATER_EMBEDDED_V4
 #include "archipelago_client.h"
 #include <stdafx.h>
 #ifdef __x86_64__
@@ -190,6 +191,12 @@ void init()
 
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
+    // The self-updater runs from a temporary copy before SDL/game initialization.
+    int apUpdaterExitCode = 0;
+    if (APSelfUpdate::HandleHelperInvocation(argc, argv, apUpdaterExitCode))
+        return apUpdaterExitCode;
+#endif
 #ifdef _WIN32
     timeBeginPeriod(1);
 #endif
