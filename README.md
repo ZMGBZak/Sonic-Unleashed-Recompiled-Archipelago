@@ -4,6 +4,17 @@
 
 ---
 
+## About this Archipelago fork
+
+**This repository contains an unofficial modified version (fork/derivative) of [hedge-dev's Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp), adding Archipelago multiworld support.** The original PC port was developed by the Unleashed Recompiled contributors. This Archipelago edition is a separate community modification, not an official upstream release or endorsement.
+
+- **Original source project:** https://github.com/hedge-dev/UnleashedRecomp
+- **Archipelago modification source:** https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago/tree/archipelago-prototype
+- **Updates and releases:** https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases
+- **Original license:** [GNU GPL version 3](https://www.gnu.org/licenses/gpl-3.0.en.html). GPLv3 obligations apply to redistributed modified binaries and their complete corresponding source.
+
+For the base game and its installation requirements, please use the original project's documentation below. The Archipelago edition does not grant any rights to Sonic Unleashed game assets.
+
 Unleashed Recompiled is an unofficial PC port of the Xbox 360 version of Sonic Unleashed created through the process of static recompilation. The port offers Windows and Linux support with numerous built-in enhancements such as high resolutions, ultrawide support, high frame rates, improved performance and modding.
 
 **This project does not include any game assets. You must provide the files from your own legally acquired copy of the game to install or build Unleashed Recompiled.**
