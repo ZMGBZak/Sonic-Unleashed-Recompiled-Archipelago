@@ -35,6 +35,17 @@ class SonicUnleashedWorld(World):
             for _ in range(count):
                 self.multiworld.itempool.append(self.create_item(name))
 
+        # These Shoes are required near the beginning of the game. Restrict
+        # them to immediately reachable local checks so a medal-gated optional
+        # Act can never hide an ability needed for the next story stage.
+        for name in ("Stomping Shoes", "Wall Jump Shoes"):
+            self.multiworld.local_early_items[self.player][name] = 1
+
+        # The later mandatory Shoes are also prioritized for early checks.
+        # They may still be sent from another player's starting locations.
+        for name in ("Air Boost Shoes", "Light Speed Dash Shoes"):
+            self.multiworld.early_items[self.player][name] = 1
+
         # Match the item pool to the locations actually created for this slot.
         available_locations = sum(
             1 for name in location_table
