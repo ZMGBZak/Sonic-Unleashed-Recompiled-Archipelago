@@ -3,7 +3,7 @@ import re
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 LOCATIONS = (ROOT / "archipelago" / "sonic_unleashed" / "Locations.py").read_text(encoding="utf-8")
 CLIENT = (ROOT / "UnleashedRecomp" / "archipelago_client.cpp").read_text(encoding="utf-8")
 
