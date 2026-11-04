@@ -43,6 +43,12 @@ STORY = {
     "Final Dark Gaia": (("Egg Dragoon",), (), 0, 0),
 }
 
+# Optional Gaia Gates must account for the actual in-game medal requirements,
+# otherwise fill may hide a required Shoe behind an inaccessible Act.
+OPTIONAL_ACT_MEDAL_REQUIREMENTS = {
+    "Savannah Citadel - Day Act 3": (5, 0),  # Sun Medal level 3 (30 medals).
+}
+
 STAGE_COUNTRIES = {
     "Windmill Isle": "Apotos",
     "Savannah Citadel": "Mazuri",
@@ -113,7 +119,10 @@ def _stage_access(state, player, stem):
             # The additional Acts are accessed after their first main Act.
             # Some optional Gaia Gates may need MORE medals; those can be added
             # individually once their exact requirements are verified in game.
-            return state.has(event_item(root), player)
+            sun, moon = OPTIONAL_ACT_MEDAL_REQUIREMENTS.get(stem, (0, 0))
+            return (state.has(event_item(root), player)
+                    and state.has("Sun Medal", player, sun)
+                    and state.has("Moon Medal", player, moon))
         return False  # Do not accidentally declare unknown stages accessible.
 
     return False
