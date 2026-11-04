@@ -61,6 +61,9 @@ constexpr std::int64_t kRankGroupBases[] = {
     88000587LL, 88000592LL, 88000597LL, 88000602LL, 88000607LL, 88000612LL,
     88000617LL, 88000622LL, 88000627LL, 88000632LL, 88000637LL, 88000642LL,
     88000647LL, 88000652LL, 88000657LL, 88000662LL, 88000667LL,
+    // Additional Act 2/3 and DLC groups from Locations.py.
+    88000805LL, 88000810LL, 88000815LL, 88000820LL, 88000825LL, 88000830LL, 88000835LL, 88000840LL, 88000845LL, 88000850LL, 88000855LL,
+    88000860LL, 88000865LL, 88000870LL, 88000875LL, 88000880LL, 88000885LL, 88000890LL, 88000895LL, 88000900LL, 88000905LL, 88000910LL, 88000915LL, 88000920LL, 88000925LL
  };
 
 bool GetRankLocationGroup(std::int64_t id, std::int64_t& base, int& rankIndex)
@@ -82,7 +85,7 @@ bool GetRankLocationGroup(std::int64_t id, std::int64_t& base, int& rankIndex)
 bool IsDlcLocation(std::int64_t id)
 {
     return
-        (id >= 88000386LL && id <= 88000395LL) ||
+        (id >= 88000386LL && id <= 88000400LL) ||
         (id >= 88000441LL && id <= 88000445LL) ||
         (id >= 88000451LL && id <= 88000455LL) ||
         (id >= 88000461LL && id <= 88000470LL) ||
@@ -97,7 +100,8 @@ bool IsDlcLocation(std::int64_t id)
         (id >= 88000596LL && id <= 88000605LL) ||
         (id >= 88000616LL && id <= 88000630LL) ||
         (id >= 88000641LL && id <= 88000645LL) ||
-        (id >= 88000651LL && id <= 88000655LL);
+        (id >= 88000651LL && id <= 88000655LL) ||
+        (id >= 88000859LL && id <= 88000928LL);
 }
 
 bool IsLocationAllowed(std::int64_t id)
