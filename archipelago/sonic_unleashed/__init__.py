@@ -1,10 +1,11 @@
 from BaseClasses import Item
 from worlds.AutoWorld import World
 from .Items import item_table, item_classifications
-from .Locations import location_table, internal_to_id
+from .Locations import location_table, internal_to_id, MEDAL_LOCATION_IDS
 from .Regions import create_regions
 from .Options import SonicUnleashedOptions
-from .Logic import create_event_locations, install_rules
+from .Logic import create_event_locations, install_rules, shoe_location_allowed
+from worlds.generic.Rules import add_item_rule
 
 class SonicUnleashedWorld(World):
     game = "Sonic Unleashed"
@@ -80,9 +81,18 @@ class SonicUnleashedWorld(World):
         # The client still reports the actual victory via CLIENT_GOAL.
         regions = {r.name: r for r in self.multiworld.regions if r.player == self.player}
         install_rules(self, regions)
+        # Different shoes can appear in different DLC Acts, exactly as
+        # specified in the progression whitelist.  Non-shoe rewards (including
+        # Sun/Moon Medal packs) remain eligible if a location is reachable.
+        for region in regions.values():
+            for location in region.locations:
+                if location.address is not None:
+                    add_item_rule(location, lambda item, name=location.name:
+                                  item.player != self.player or
+                                  shoe_location_allowed(name, item.name))
         self.multiworld.completion_condition[self.player] = (
             lambda state: state.has("Victory", self.player)
         )
 
     def fill_slot_data(self):
-        return {"version": 4, "apworld_version": "0.8.2", "medal_location_ids": internal_to_id, "goal": self.options.goal.value, "include_dlc": bool(self.options.include_dlc.value), "include_collectibles": bool(self.options.include_collectibles.value), "required_rank_for_all_checks": self.options.required_rank_for_all_checks.value, "medal_goal_target": sum(1 for loc_id in location_table.values() if 88000001 <= loc_id <= 88000370)}
+        return {"version": 4, "apworld_version": "0.8.2", "medal_location_ids": internal_to_id, "goal": self.options.goal.value, "include_dlc": bool(self.options.include_dlc.value), "include_collectibles": bool(self.options.include_collectibles.value), "required_rank_for_all_checks": self.options.required_rank_for_all_checks.value, "medal_goal_target": len(MEDAL_LOCATION_IDS)}

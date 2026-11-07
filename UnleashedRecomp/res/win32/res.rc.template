@@ -9,7 +9,10 @@
 #define UNLEASHED_RECOMP_FILE_FLAGS 0
 #endif
 
-IDI_ICON1 ICON "@WIN32_ICON_PATH@"
+// AP_HUMMATION_LOGO_V1: the paths expand during CMake configure_file.
+// CMAKE_SOURCE_DIR is defined by CMake; no new CMakeLists variable is needed.
+IDI_ICON1 ICON "@CMAKE_SOURCE_DIR@/UnleashedRecomp/res/win32/Logo_HumMation.ico"
+2002 RCDATA "@CMAKE_SOURCE_DIR@/UnleashedRecomp/res/archipelago/Logo_HumMation_F8.png"
 2001 RCDATA "@AP_MEDALS_ATLAS_PATH@"
 
 VS_VERSION_INFO VERSIONINFO

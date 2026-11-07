@@ -61,7 +61,14 @@ constexpr std::int64_t kRankGroupBases[] = {
     88000587LL, 88000592LL, 88000597LL, 88000602LL, 88000607LL, 88000612LL,
     88000617LL, 88000622LL, 88000627LL, 88000632LL, 88000637LL, 88000642LL,
     88000647LL, 88000652LL, 88000657LL, 88000662LL, 88000667LL,
- };
+
+    // AP V0.8.3 DLC rank group hotfix
+    88000805LL, 88000810LL, 88000815LL, 88000820LL, 88000825LL, 88000830LL,
+    88000835LL, 88000840LL, 88000845LL, 88000850LL, 88000855LL, 88000860LL,
+    88000865LL, 88000870LL, 88000875LL, 88000880LL, 88000885LL, 88000890LL,
+    88000895LL, 88000900LL, 88000905LL, 88000910LL, 88000915LL, 88000920LL,
+    88000925LL,
+};
 
 bool GetRankLocationGroup(std::int64_t id, std::int64_t& base, int& rankIndex)
 {
@@ -82,7 +89,7 @@ bool GetRankLocationGroup(std::int64_t id, std::int64_t& base, int& rankIndex)
 bool IsDlcLocation(std::int64_t id)
 {
     return
-        (id >= 88000386LL && id <= 88000395LL) ||
+        (id >= 88000386LL && id <= 88000400LL) ||
         (id >= 88000441LL && id <= 88000445LL) ||
         (id >= 88000451LL && id <= 88000455LL) ||
         (id >= 88000461LL && id <= 88000470LL) ||
@@ -97,7 +104,9 @@ bool IsDlcLocation(std::int64_t id)
         (id >= 88000596LL && id <= 88000605LL) ||
         (id >= 88000616LL && id <= 88000630LL) ||
         (id >= 88000641LL && id <= 88000645LL) ||
-        (id >= 88000651LL && id <= 88000655LL);
+        (id >= 88000651LL && id <= 88000655LL) ||
+        (id >= 88000859LL && id <= 88000928LL)
+    ;
 }
 
 bool IsLocationAllowed(std::int64_t id)
@@ -111,6 +120,13 @@ bool IsLocationAllowed(std::int64_t id)
 
 // Morts recues depuis Archipelago, protegees par apMutex.
 std::uint32_t apPendingIncomingDeathLinks = 0;
+// AP_DEATHLINK_HUB_GUARD_V1: all fields below are protected by apMutex.
+// The stage flag is driven from game-thread player hooks, never inspected
+// from the network thread through the game document's memory.
+std::string apDeathLinkCurrentStage;
+bool apDeathLinkStageEligible = false;
+std::chrono::steady_clock::time_point apDeathLinkStageSeenAt{};
+
 
     std::unordered_set<std::int64_t> apPending;
     std::unordered_set<std::int64_t> apConfirmed;
@@ -2645,12 +2661,12 @@ bool apSuperClawsStateLoadedSuccessfully = false;
         const std::int64_t bossGoalLocation =
             apSelectedGoal == 0 ? 88000666LL :
             apSelectedGoal == 1 ? 88000661LL : -1LL;
-        // AP_ENTRANCE_SHARED_V1: all 338 unique server-confirmed medal locations.
+        // AP_MEDAL_GOAL_EXPANDED: include all mapped medal IDs, including side Acts above 88000370.
         if (apSelectedGoal == 2 && !apGoalSent)
         {
             int medalCount = 0;
             for (const auto medalId : apConfirmed)
-                if (medalId >= 88000001LL && medalId <= 88000370LL) ++medalCount;
+                if (AP_MedalDisplayName(medalId) != nullptr) ++medalCount;
             if (medalCount >= apMedalGoalTarget) { apGoalPending = true; apWake.notify_all(); }
         }
         if (bossGoalLocation >= 0 &&
@@ -3194,7 +3210,7 @@ LoadPowerShieldState();
                                 apIncludeDlc = option.get<int>() != 0;
                         }
                     }
-                    // Goal total stays aligned with slot data. Older rooms default to 338.
+                    // Prefer slot data target (367 for this APWorld); older rooms retain 338 as fallback.
                     apMedalGoalTarget = 338;
                     if (packet.contains("slot_data") && packet["slot_data"].is_object() &&
                         packet["slot_data"].contains("medal_goal_target") &&
@@ -3322,12 +3338,21 @@ LoadPowerShieldState();
 
                         std::fflush(stdout);
 
+                        bool accepted = false;
                         {
                             std::lock_guard<std::mutex> lock(apMutex);
-                            ++apPendingIncomingDeathLinks;
+                            if (apDeathLinkStageEligible &&
+                                std::chrono::steady_clock::now() - apDeathLinkStageSeenAt < std::chrono::seconds(2))
+                            {
+                                ++apPendingIncomingDeathLinks;
+                                accepted = true;
+                            }
                         }
 
-                        LOGFN("[AP DEATH LINK INCOMING] Pending death queued");
+                        if (accepted)
+                            LOGFN("[AP DEATH LINK INCOMING] Pending death queued in playable Act");
+                        else
+                            LOGFN("[AP DEATH LINK HUB GUARD] Incoming Death Link ignored outside playable Act");
                     }
                 }
             }
@@ -5109,12 +5134,38 @@ void APClient::QueueDeathLink()
 }
 
 
+// AP_DEATHLINK_HUB_GUARD_V1 - called from the actual player update hooks.
+// Changing Acts discards stale Death Links received during scene transitions.
+// Hub/menu stages are NEVER eligible and their pending Death Links are cleared.
+namespace APClient {
+void UpdateDeathLinkStage(const char* currentStage, bool isPlayableAct)
+{
+    const std::string nextStage = currentStage ? currentStage : "";
+    std::lock_guard<std::mutex> lock(apMutex);
+    const auto now = std::chrono::steady_clock::now();
+    const bool sceneUpdateGap = apDeathLinkStageSeenAt.time_since_epoch().count() == 0 ||
+        now - apDeathLinkStageSeenAt >= std::chrono::seconds(2);
+    if (nextStage != apDeathLinkCurrentStage || !isPlayableAct || sceneUpdateGap)
+    {
+        if (apPendingIncomingDeathLinks != 0)
+        {
+            LOGFN("[AP DEATH LINK HUB GUARD] Discarded {} pending deaths (stage='{}')",
+                apPendingIncomingDeathLinks, nextStage);
+            apPendingIncomingDeathLinks = 0;
+        }
+    }
+    apDeathLinkCurrentStage = nextStage;
+    apDeathLinkStageEligible = isPlayableAct;
+    apDeathLinkStageSeenAt = now;
+}
+}
+
 // Recupere une mort entrante depuis le thread du jeu.
 bool APClient::ConsumeIncomingDeathLink()
 {
     std::lock_guard<std::mutex> lock(apMutex);
 
-    if (apPendingIncomingDeathLinks == 0)
+    if (!apDeathLinkStageEligible || apPendingIncomingDeathLinks == 0)
         return false;
 
     --apPendingIncomingDeathLinks;
@@ -5249,9 +5300,24 @@ std::vector<APClient::MultiplayerEvent> APClient::DrainMultiplayerEvents()
 
 std::string APClient::ResolveMultiplayerItemName(const MultiplayerEvent& event)
 {
-    if (!event.itemName.empty()) return event.itemName;
+    // AP_PROGRESSIVE_MEDAL_NAMES_V1: the IDs did not change (88001001/88001002).
+    // Normalize only items received by a Sonic Unleashed slot.  An older
+    // Archipelago room may still advertise the original item names, while
+    // the client should display the new names consistently in send/receive
+    // notifications.  Never change names belonging to other games.
     std::lock_guard<std::mutex> lock(apMutex);
     const auto game = apMultiPlayerGames.find(event.destinationSlot);
+    const bool isUnleashedItem =
+        (game != apMultiPlayerGames.end() && game->second == "Sonic Unleashed") ||
+        (apMultiOwnSlot >= 0 && event.destinationSlot == apMultiOwnSlot);
+
+    if (isUnleashedItem)
+    {
+        if (event.itemId == kSunMedalItemId) return "Progressive Sun Medal";
+        if (event.itemId == kMoonMedalItemId) return "Progressive Moon Medal";
+    }
+
+    if (!event.itemName.empty()) return event.itemName;
     if (game != apMultiPlayerGames.end())
     {
         const auto items = apMultiItemNames.find(game->second);
@@ -5261,13 +5327,14 @@ std::string APClient::ResolveMultiplayerItemName(const MultiplayerEvent& event)
             if (found != items->second.end()) return found->second;
         }
     }
-    // AP's own IDs can be named immediately, even before DataPackage arrives.
-    if (event.itemId == 88001001LL) return "Sun Medal";
-    if (event.itemId == 88001002LL) return "Moon Medal";
-    if (event.itemId == 88001004LL) return "Stomping Shoes";
-    if (event.itemId == 88001005LL) return "Wall Jump Shoes";
-    if (event.itemId == 88001006LL) return "Air Boost Shoes";
-    if (event.itemId == 88001007LL) return "Light Speed Dash Shoes";
+    // Preserve pre-DataPackage fallbacks from the old client for its own slot.
+    if (isUnleashedItem)
+    {
+        if (event.itemId == kStompItemId) return "Stomping Shoes";
+        if (event.itemId == kWallJumpItemId) return "Wall Jump Shoes";
+        if (event.itemId == kAirBoostItemId) return "Air Boost Shoes";
+        if (event.itemId == kLightSpeedDashItemId) return "Light Speed Dash Shoes";
+    }
     return "Item #" + std::to_string(event.itemId);
 }
 int APClient::GetMedalGoalTarget()
@@ -5283,7 +5350,7 @@ namespace APClient {
         if (!apAuthenticated || apSelectedGoal != 2) return -1;
         int count = 0;
         for (const auto id : apConfirmed)
-            if (id >= 88000001LL && id <= 88000370LL) ++count;
+            if (AP_MedalDisplayName(id) != nullptr) ++count;
         return count;
     }
 }
@@ -5354,6 +5421,8 @@ void APClient::CancelSuperClaws()
 }
 
 #else
+// AP_DEATHLINK_HUB_GUARD_V1: native Linux client uses its own transport layer.
+namespace APClient { void UpdateDeathLinkStage(const char*, bool) {} }
 // AP_MULTIWORLD_HUD_V082: non-Windows build fallback.
 std::vector<APClient::MultiplayerEvent> APClient::DrainMultiplayerEvents() { return {}; }
 std::string APClient::ResolveMultiplayerItemName(const MultiplayerEvent& event)
@@ -5586,7 +5655,7 @@ namespace APClient {
         if (!apAuthenticated || apSelectedGoal != 2) return -1;
         int count = 0;
         for (const auto id : apConfirmed)
-            if (id >= 88000001LL && id <= 88000370LL) ++count;
+            if (AP_MedalDisplayName(id) != nullptr) ++count;
         return count;
     }
 }

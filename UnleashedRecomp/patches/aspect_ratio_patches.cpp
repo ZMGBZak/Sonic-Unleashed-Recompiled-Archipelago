@@ -32,6 +32,10 @@
 
 // AP_TRAP_ACT_END_GUARD_V082: implemented in input_patches.cpp.
 void AP_NotifyTrapStageFinished();
+// AP_DEATHLINK_HUB_GUARD_V1: forward declaration; implementation lives in
+// archipelago_client.cpp to keep the server-side queue thread-safe.
+namespace APClient { void UpdateDeathLinkStage(const char* currentStage, bool isPlayableAct); }
+
 
 // These are here for now to not recompile basically all of the project.
 namespace Chao::CSD
@@ -2590,6 +2594,29 @@ static const std::unordered_map<std::string, int64_t> apMedalLocationIds = {
     {"ActD_SubAfrica_01_Sun_0", 88000932},
     {"ActD_SubAfrica_01_Moon_0", 88000933},
     {"ActD_SubAfrica_01_Moon_1", 88000934},
+    {"ActN_SubAfrica_01_Sun_0", 88000935},
+    {"ActN_SubAfrica_01_Sun_1", 88000936},
+    {"ActN_SubAfrica_01_Sun_2", 88000937},
+    {"ActN_SubAfrica_01_Sun_3", 88000938},
+    {"ActN_SubAfrica_01_Moon_0", 88000939},
+    {"ActD_SubEU_01_Sun_0", 88000940},
+    {"ActD_SubEU_01_Moon_0", 88000941},
+    {"ActD_SubEU_01_Moon_1", 88000942},
+    {"ActD_SubEU_02_Sun_0", 88000943},
+    {"ActD_SubEU_02_Moon_0", 88000944},
+    {"ActD_SubEU_02_Moon_1", 88000945},
+    {"ActD_SubPetra_03_Sun_0", 88000946},
+    {"ActD_SubPetra_03_Moon_0", 88000947},
+    {"ActD_SubPetra_03_Moon_1", 88000948},
+    {"ActD_SubNY_01_Sun_0", 88000949},
+    {"ActD_SubNY_01_Moon_0", 88000950},
+    {"ActD_SubNY_01_Moon_1", 88000951},
+    {"ActD_SubBeach_02_Sun_0", 88000952},
+    {"ActD_SubBeach_02_Moon_0", 88000953},
+    {"ActD_SubBeach_02_Moon_1", 88000954},
+    {"ActD_SubBeach_04_Sun_0", 88000955},
+    {"ActD_SubBeach_04_Moon_0", 88000956},
+    {"ActD_SubBeach_04_Moon_1", 88000957},
 };
 
 // AP_ACT_DIAG_COMPAT: diagnostic only - source BEFORE Act Fix V1.
@@ -2613,7 +2640,7 @@ static std::string AP_ActDiagStage()
 }
 
 // AP ACT CLEAR + RANK CHECKS (61-stage server test).
-// All 370 medal locations are unchanged. Stage metadata is in ap_stage_registry.h.
+// Medal checks now cover 367 unique locations; legacy IDs remain stable. Stage metadata is in ap_stage_registry.h.
 static std::string apRankLastStage;
 static std::chrono::steady_clock::time_point apRankStageSeenAt = std::chrono::steady_clock::now();
 static std::unordered_map<uint32_t, uint32_t> apRankPreviouslyReadByObject;
@@ -4345,8 +4372,21 @@ PPC_FUNC(sub_82310F20)
         apLoggedSonicUpdate = true;
     }
 
+    // AP_DEATHLINK_HUB_GUARD_V1: never consume a remote death in a hub,
+    // city, or during a transition.  Require a known playable Act/boss.
+    const auto* apDayDoc = SWA::CGameDocument::GetInstance();
+    const char* apDayStage = (apDayDoc && apDayDoc->m_pMember)
+        ? apDayDoc->m_pMember->m_StageName.c_str() : "";
+    const bool apDayEligible =
+        apRankActLocations.find(apDayStage) != apRankActLocations.end() &&
+        (std::strncmp(apDayStage, "ActD_", 5) == 0 ||
+         std::strncmp(apDayStage, "Boss", 4) == 0 ||
+         std::strcmp(apDayStage, "Act_EggmanLand") == 0);
+    if (sonicObject != 0)
+        APClient::UpdateDeathLinkStage(apDayStage, apDayEligible);
+
     // Time-based guard also expires if the last Death Link happened at night.
-    if (sonicObject != 0 && AP_CanInjectDeathLink())
+    if (sonicObject != 0 && apDayEligible && AP_CanInjectDeathLink())
     {
         const uint32_t sonicContext =
             PPC_LOAD_U32(sonicObject + 196);
@@ -4422,6 +4462,9 @@ PPC_FUNC(sub_823B0168)
             std::strcmp(apTestStage, "BossEggDragoon") == 0 ||
             std::strcmp(apTestStage, "Act_EggmanLand") == 0
         );
+
+    if (apStats != 0)
+        APClient::UpdateDeathLinkStage(apTestStage, apValidWerehogStage);
 
     if (apStats != 0 &&
         apValidWerehogStage &&

@@ -1400,8 +1400,8 @@ extern ImFontBuilderIO g_fontBuilderIO;
 #ifdef _WIN32
 namespace APUpdateV1
 {
-    constexpr const char* kClientVersion = "0.8.2"; // First public release after updater test.
-    constexpr const char* kAPWorldVersion = "0.8.2";
+    constexpr const char* kClientVersion = "0.8.4"; // First public release after updater test.
+    constexpr const char* kAPWorldVersion = "0.8.3";
     constexpr const char* kReleasePage =
         "https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases";
     constexpr const char* kAssetRoot =
@@ -2461,6 +2461,50 @@ namespace APRouletteUI
     }
 }
 // AP_RING_ROULETTE_V2_SKIN_END
+// AP_HUMMATION_LOGO_V1_BEGIN - optional cosmetic asset embedded in the Windows executable.
+// Art credit: HumMation. UI and notification fallbacks are preserved if the resource is missing.
+namespace APHumMationLogo
+{
+    static std::unique_ptr<GuestTexture> texture;
+    static bool attempted = false;
+
+    static GuestTexture* GetTexture()
+    {
+#ifdef _WIN32
+        if (!attempted)
+        {
+            attempted = true;
+            HMODULE module = GetModuleHandleW(nullptr);
+            if (module)
+            {
+                HRSRC resource = FindResourceA(module, MAKEINTRESOURCEA(2002), RT_RCDATA);
+                if (resource)
+                {
+                    const DWORD size = SizeofResource(module, resource);
+                    HGLOBAL loaded = LoadResource(module, resource);
+                    const void* data = loaded ? LockResource(loaded) : nullptr;
+                    if (data && size)
+                    {
+                        try
+                        {
+                            texture = LoadTexture(static_cast<const uint8_t*>(data),
+                                                  static_cast<size_t>(size));
+                        }
+                        catch (...)
+                        {
+                            // The logo is optional: never interrupt rendering or gameplay.
+                        }
+                    }
+                }
+            }
+            if (!texture)
+                std::printf("AP LOGO: resource 2002 unavailable; keeping vector fallback\n");
+        }
+#endif
+        return texture.get();
+    }
+}
+// AP_HUMMATION_LOGO_V1_END
 #include "ap_multiplayer_overlay.h" // AP_MULTIWORLD_HUD_V082
 
 static void CreateImGuiBackend()
@@ -4228,7 +4272,7 @@ static void DrawImGui()
             {
                 ImVec2 headerPos = ImGui::GetCursorScreenPos();
                 float headerWidth = ImGui::GetContentRegionAvail().x;
-                float headerHeight = 100.0f;
+                float headerHeight = 112.0f;
 
                 ImDrawList* draw = ImGui::GetWindowDrawList();
 
@@ -4263,72 +4307,60 @@ static void DrawImGui()
                     2.0f
                 );
 
-                // Petit embleme technologique.
-                ImVec2 emblem(
-                    headerPos.x + 35.0f,
-                    headerPos.y + 42.0f
-                );
-
-                draw->AddCircleFilled(
-                    emblem,
-                    24.0f,
-                    IM_COL32(5, 24, 53, 255),
-                    32
-                );
-
-                draw->AddCircle(
-                    emblem,
-                    23.0f,
-                    IM_COL32(80, 190, 255, 230),
-                    32, 2.5f
-                );
-
-                draw->AddCircle(
-                    emblem,
-                    16.0f,
-                    IM_COL32(160, 225, 255, 190),
-                    32, 1.5f
-                );
-
-                // Lignes du globe Archipelago.
-                draw->AddLine(
-                    ImVec2(emblem.x - 16.0f, emblem.y),
-                    ImVec2(emblem.x + 16.0f, emblem.y),
-                    IM_COL32(110, 215, 255, 220),
-                    1.5f
-                );
-
-                draw->AddLine(
-                    ImVec2(emblem.x, emblem.y - 16.0f),
-                    ImVec2(emblem.x, emblem.y + 16.0f),
-                    IM_COL32(110, 215, 255, 220),
-                    1.5f
-                );
+                // Logo officiel (HumMation), integre dans l'executable Windows.
+                // L'embleme initial reste en secours si la ressource est introuvable.
+                if (auto* apLogoTexture = APHumMationLogo::GetTexture())
+                {
+                    draw->AddImage(apLogoTexture,
+                        ImVec2(headerPos.x + 8.0f, headerPos.y + 12.0f),
+                        ImVec2(headerPos.x + 92.0f, headerPos.y + 96.0f));
+                }
+                else
+                {
+                    const ImVec2 emblem(headerPos.x + 35.0f, headerPos.y + 42.0f);
+                    draw->AddCircleFilled(emblem, 24.0f, IM_COL32(5, 24, 53, 255), 32);
+                    draw->AddCircle(emblem, 23.0f, IM_COL32(80, 190, 255, 230), 32, 2.5f);
+                    draw->AddCircle(emblem, 16.0f, IM_COL32(160, 225, 255, 190), 32, 1.5f);
+                    draw->AddLine(ImVec2(emblem.x - 16.0f, emblem.y),
+                                  ImVec2(emblem.x + 16.0f, emblem.y),
+                                  IM_COL32(110, 215, 255, 220), 1.5f);
+                    draw->AddLine(ImVec2(emblem.x, emblem.y - 16.0f),
+                                  ImVec2(emblem.x, emblem.y + 16.0f),
+                                  IM_COL32(110, 215, 255, 220), 1.5f);
+                }
 
                 // Titres du panneau.
                 draw->AddText(
-                    ImVec2(headerPos.x + 72.0f, headerPos.y + 17.0f),
+                    ImVec2(headerPos.x + 99.0f, headerPos.y + 17.0f),
                     IM_COL32(155, 210, 255, 255),
                     "SONIC UNLEASHED"
                 );
 
                 draw->AddText(
-                    ImVec2(headerPos.x + 72.0f, headerPos.y + 43.0f),
+                    ImVec2(headerPos.x + 99.0f, headerPos.y + 43.0f),
                     IM_COL32(240, 248, 255, 255),
                     "ARCHIPELAGO CONNECTOR"
                 );
 
                 // Credits du createur, toujours visibles dans l'en-tete F8.
                 draw->AddText(
-                    ImVec2(headerPos.x + 74.0f, headerPos.y + 62.0f),
+                    ImVec2(headerPos.x + 101.0f, headerPos.y + 62.0f),
                     IM_COL32(155, 225, 255, 255),
                     "Created by ZMGB_Zak"
                 );
 
+                // Credit artistique permanent sous le nom du createur.
+                draw->AddText(
+                    ImGui::GetFont(), 12.0f,
+                    ImVec2(headerPos.x + 101.0f, headerPos.y + 81.0f),
+                    IM_COL32(170, 212, 241, 255),
+                    "Logo by HumMation"
+                );
+
                 // Barre lumineuse sous le titre.
                 draw->AddLine(
-                    ImVec2(headerPos.x + 73.0f, headerPos.y + 87.0f),
-                    ImVec2(headerEnd.x - 18.0f, headerPos.y + 87.0f),
+                    ImVec2(headerPos.x + 99.0f, headerPos.y + 109.0f),
+                    ImVec2(headerEnd.x - 18.0f, headerPos.y + 97.0f),
                     IM_COL32(40, 175, 255, 170),
                     2.0f
                 );

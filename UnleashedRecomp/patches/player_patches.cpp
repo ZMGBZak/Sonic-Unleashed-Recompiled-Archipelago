@@ -16,9 +16,13 @@ void AP_RequestFreezeRestart();
 #include <app.h>
 #include <apu/custom_music.h>
 #include <sdl_events.h>
+#include <string>
 
 static uint32_t g_lastEnemyScore;
 static uint32_t g_lastTrickScore;
+// AP_CHECKPOINT_SCORE_V1: bind checkpoint scores to the actual stage.
+static std::string g_checkpointScoreStage;
+static bool g_hasCheckpointScore = false;
 static float g_lastDarkGaiaEnergy;
 static bool g_isUnleashCancelled;
 
@@ -57,15 +61,56 @@ PPC_FUNC(sub_82624308)
 
     if (auto pGameDocument = SWA::CGameDocument::GetInstance())
     {
+        if (!pGameDocument->m_pMember)
+            return;
+
         g_lastEnemyScore =
             pGameDocument->m_pMember->m_ScoreInfo.EnemyScore;
 
         g_lastTrickScore =
             pGameDocument->m_pMember->m_ScoreInfo.TrickScore;
 
-        LOGFN("Score: {}", g_lastEnemyScore + g_lastTrickScore);
+        // The checkpoint state must not leak into another stage.
+        g_checkpointScoreStage = pGameDocument->m_pMember->m_StageName.c_str();
+        g_hasCheckpointScore = !g_checkpointScoreStage.empty();
+
+        LOGFN("[AP CHECKPOINT SCORE] saved stage={} enemy={} trick={}",
+            g_checkpointScoreStage, g_lastEnemyScore, g_lastTrickScore);
     }
 }
+
+// AP_CHECKPOINT_SCORE_V1
+// The original function clears the score on respawn. Reapply only the last
+// checkpoint snapshot from this same Act. The mid-ASM full restart hook below
+// clears the snapshot before this function runs on a manual Act restart.
+PPC_FUNC_IMPL(__imp__sub_8245F048);
+PPC_FUNC(sub_8245F048)
+{
+    __imp__sub_8245F048(ctx, base);
+
+    if (!Config::SaveScoreAtCheckpoints)
+        return;
+
+    auto* doc = SWA::CGameDocument::GetInstance();
+    if (!doc || !doc->m_pMember)
+        return;
+
+    const char* stage = doc->m_pMember->m_StageName.c_str();
+    if (!g_hasCheckpointScore || !stage || g_checkpointScoreStage != stage)
+    {
+        // No checkpoint reached in this Act, or a different Act: leave 0.
+        LOGFN("[AP CHECKPOINT SCORE] no valid checkpoint for stage={}",
+            stage ? stage : "");
+        return;
+    }
+
+    auto& score = doc->m_pMember->m_ScoreInfo;
+    score.EnemyScore = g_lastEnemyScore;
+    score.TrickScore = g_lastTrickScore;
+    LOGFN("[AP CHECKPOINT SCORE] restored stage={} enemy={} trick={}",
+        g_checkpointScoreStage, g_lastEnemyScore, g_lastTrickScore);
+}
+// AP_CHECKPOINT_SCORE_V1_END
 
 void AP_NotifyCustomMusicRestart(bool wasPlaying);
 
@@ -80,6 +125,8 @@ void ResetScoreOnRestartMidAsmHook()
     AP_NotifyCustomMusicRestart(CustomMusic::IsPlaying());
     g_lastEnemyScore = 0;
     g_lastTrickScore = 0;
+    g_hasCheckpointScore = false;
+    g_checkpointScoreStage.clear();
 }
 
 void PostUnleashMidAsmHook(PPCRegister& r30)

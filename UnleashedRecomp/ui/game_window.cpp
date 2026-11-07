@@ -286,6 +286,32 @@ void GameWindow::SetIcon(void* pIconBmp, size_t iconSize)
 
 void GameWindow::SetIcon(bool isNight)
 {
+#if defined(_WIN32)
+    // AP_TASKBAR_HUMMATION_WINDOWS_V084: keep HumMation artwork on the Windows taskbar.
+    // Linux continues to use the existing day/night SDL icons below.
+    if (s_pWindow != nullptr)
+    {
+        SDL_SysWMinfo wmInfo{};
+        SDL_VERSION(&wmInfo.version);
+        if (SDL_GetWindowWMInfo(s_pWindow, &wmInfo) && wmInfo.subsystem == SDL_SYSWM_WINDOWS)
+        {
+            HMODULE executable = GetModuleHandleW(nullptr);
+            HICON smallIcon = reinterpret_cast<HICON>(LoadImageW(
+                executable, L"IDI_ICON1", IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+            HICON bigIcon = reinterpret_cast<HICON>(LoadImageW(
+                executable, L"IDI_ICON1", IMAGE_ICON,
+                GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED));
+            if (smallIcon && bigIcon)
+            {
+                HWND window = wmInfo.info.win.window;
+                SendMessageW(window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
+                SendMessageW(window, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(bigIcon));
+                return;
+            }
+        }
+    }
+#endif
     if (isNight)
     {
         SetIcon(g_game_icon_night, sizeof(g_game_icon_night));

@@ -169,14 +169,41 @@ namespace APMultiplayerOverlay
             dl->AddRect(a,b,WithAlpha(IM_COL32(146,214,245,225),fade),17*scale,0,1.7f*scale);
             dl->AddLine(ImVec2(a.x+17*scale,a.y+2*scale),ImVec2(b.x-17*scale,a.y+2*scale),WithAlpha(IM_COL32(195,235,255,190),fade),1.5f*scale);
             dl->AddRectFilled(ImVec2(a.x + 2*scale,a.y + 16*scale),ImVec2(a.x + 6*scale,b.y - 16*scale),WithAlpha(trim,fade),3*scale);
-            // Round badge, consistent with the F8 metallic neon language.
+            // HumMation logo for both sent and received notifications. The direction
+            // indicator stays visible so these two events remain distinguishable.
             const ImVec2 center(a.x + 34*scale, a.y + 45*scale);
-            dl->AddCircleFilled(center,21*scale,WithAlpha(IM_COL32(7,27,59,240),fade),32);
-            dl->AddCircle(center,21*scale,WithAlpha(trim,fade),32,1.7f*scale);
+            dl->AddCircleFilled(center,24*scale,WithAlpha(IM_COL32(7,27,59,240),fade),32);
+            dl->AddCircle(center,24*scale,WithAlpha(trim,fade),32,1.7f*scale);
             const char* glyph = e.receivedLocally ? "+" : ">";
-            const float glyphSize = 29*scale;
-            const ImVec2 glyphW = font->CalcTextSizeA(glyphSize,FLT_MAX,0.f,glyph);
-            dl->AddText(font,glyphSize,ImVec2(center.x - glyphW.x*.5f,center.y-glyphW.y*.5f),WithAlpha(trim,fade),glyph);
+            if (auto* apLogoTexture = APHumMationLogo::GetTexture())
+            {
+                const float imageRadius = 24.f * scale;
+                dl->AddImage(apLogoTexture,
+                    ImVec2(center.x - imageRadius, center.y - imageRadius),
+                    ImVec2(center.x + imageRadius, center.y + imageRadius),
+                    ImVec2(0.f, 0.f), ImVec2(1.f, 1.f),
+                    WithAlpha(IM_COL32(255,255,255,255),fade));
+
+                // Small send/receive badge on top of the art (not a replacement for it).
+                const ImVec2 badgeCenter(center.x + 17*scale, center.y + 17*scale);
+                dl->AddCircleFilled(badgeCenter,10*scale,
+                    WithAlpha(IM_COL32(6,21,49,255),fade),24);
+                dl->AddCircle(badgeCenter,10*scale,WithAlpha(trim,fade),24,1.4f*scale);
+                const float symbolSize = 13.f * scale;
+                const ImVec2 symbolExtent = font->CalcTextSizeA(symbolSize,FLT_MAX,0.f,glyph);
+                dl->AddText(font,symbolSize,
+                    ImVec2(badgeCenter.x-symbolExtent.x*.5f,
+                           badgeCenter.y-symbolExtent.y*.5f),WithAlpha(trim,fade),glyph);
+            }
+            else
+            {
+                // Existing plus/arrow symbol remains available if PNG loading fails.
+                const float glyphSize = 29*scale;
+                const ImVec2 glyphW = font->CalcTextSizeA(glyphSize,FLT_MAX,0.f,glyph);
+                dl->AddText(font,glyphSize,
+                    ImVec2(center.x-glyphW.x*.5f,center.y-glyphW.y*.5f),
+                    WithAlpha(trim,fade),glyph);
+            }
 
             const std::string label = e.isProgression ? "PROGRESSION ITEM" : "MULTIWORLD ITEM";
             const std::string itemName = Compact(APClient::ResolveMultiplayerItemName(e), 47);

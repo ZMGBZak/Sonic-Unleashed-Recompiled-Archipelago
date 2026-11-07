@@ -1,4 +1,4 @@
-"""Sonic Unleashed Archipelago progression logic (V0.8.2 group-test candidate).
+"""Sonic Unleashed Archipelago progression logic (V0.8.2 medal-gate hotfix).
 
 The AP client handles ACTUAL goal completion.  These rules model the route and
 required abilities for Archipelago's fill/progression-balancing algorithms.
@@ -8,12 +8,18 @@ No existing location or item IDs are changed by this module.
 import re
 from BaseClasses import Item, ItemClassification, Location
 from worlds.generic.Rules import set_rule
-from .Locations import location_table
+from .Locations import location_table, MEDAL_LOCATION_IDS
 
-# Each received medal item grants 6 Sun or 4 Moon medals in the AP client.
-# Thus 5 Sun items = 30 medals; 20 Sun = 120; 20 Moon = 80.
-# Requirements are a *conservative story-route model*; optional stage and
-# collectible shortcuts are not assumed to be exhaustively documented.
+# Each received AP medal item grants 6 Sun or 4 Moon medals in the client.
+# Requirements below are counts of *received AP items*, not physical checks:
+#   physical medals: 15 -> Sun 3 or Moon 4; 30 -> Sun 5 or Moon 8;
+#   45 -> Sun 8 or Moon 12; 60 -> Sun 10 or Moon 15;
+#   80 Moon -> Moon 20; 120 Sun -> Sun 20.
+# Use ceil(required_medals / medals_per_item), so the item alone suffices.
+# AP cannot infer actual collected/check-count medals from CollectionState.
+# This is conservative where physical medals can also unlock Gaia Gates.
+# Country regions unlock with story events; Gaia Gates with medal items.
+# Optional Act Gaia Gate requirements still need separate verification.
 STORY = {
     "Windmill Isle - Day Act 1": ((), (), 0, 0),
     "Windmill Isle - Day Act 2": (("Windmill Isle - Day Act 1",), (), 0, 0),
@@ -21,21 +27,21 @@ STORY = {
     "Savannah Citadel - Night Act 1": (("Windmill Isle - Night Act 1",), (), 0, 0),
     "Savannah Citadel - Day Act 1": (("Savannah Citadel - Night Act 1",), (), 0, 0),
     "Egg Beetle": (("Savannah Citadel - Day Act 1",), (), 0, 0),
-    "Cool Edge - Day Act 1": (("Egg Beetle",), ("Stomping Shoes",), 0, 0),
-    "Rooftop Run - Night Act 1": (("Egg Beetle",), (), 0, 0),
-    "Dragon Road - Night Act 1": (("Cool Edge - Day Act 1", "Rooftop Run - Night Act 1"), (), 0, 0),
+    "Cool Edge - Day Act 1": (("Egg Beetle",), ("Stomping Shoes",), 3, 0),
+    "Rooftop Run - Night Act 1": (("Egg Beetle",), ("Stomping Shoes", "Wall Jump Shoes"), 0, 4),
+    "Dragon Road - Night Act 1": (("Cool Edge - Day Act 1", "Rooftop Run - Night Act 1"), (), 0, 8),
     "Dark Gaia Phoenix": (("Dragon Road - Night Act 1",), (), 0, 0),
-    "Rooftop Run - Day Act 1": (("Dark Gaia Phoenix",), ("Wall Jump Shoes",), 5, 0),
-    "Dragon Road - Day Act 1": (("Dark Gaia Phoenix",), ("Air Boost Shoes",), 0, 0),
+    "Rooftop Run - Day Act 1": (("Dark Gaia Phoenix",), ("Stomping Shoes", "Wall Jump Shoes"), 5, 0),
+    "Dragon Road - Day Act 1": (("Dark Gaia Phoenix",), ("Air Boost Shoes",), 8, 0),
     "Egg Devil Ray": (("Rooftop Run - Day Act 1", "Dragon Road - Day Act 1"), (), 0, 0),
-    "Cool Edge - Night Act 1": (("Egg Devil Ray",), (), 0, 0),
+    "Cool Edge - Night Act 1": (("Egg Devil Ray",), (), 0, 12),
     "Dark Moray": (("Cool Edge - Night Act 1",), (), 0, 0),
-    "Arid Sands - Day Act 1": (("Dark Moray",), ("Light Speed Dash Shoes",), 0, 0),
-    "Skyscraper Scamper - Night Act 1": (("Dark Moray",), (), 0, 0),
-    "Arid Sands - Night Act 1": (("Arid Sands - Day Act 1", "Skyscraper Scamper - Night Act 1"), (), 0, 0),
+    "Arid Sands - Day Act 1": (("Dark Moray",), ("Light Speed Dash Shoes",), 10, 0),
+    "Skyscraper Scamper - Night Act 1": (("Dark Moray",), (), 0, 15),
+    "Arid Sands - Night Act 1": (("Arid Sands - Day Act 1", "Skyscraper Scamper - Night Act 1"), (), 0, 20),
     "Dark Guardian": (("Arid Sands - Night Act 1",), (), 0, 0),
-    "Skyscraper Scamper - Day Act 1": (("Arid Sands - Day Act 1", "Skyscraper Scamper - Night Act 1"), (), 0, 0),
-    "Jungle Joyride - Night Act 1": (("Arid Sands - Day Act 1", "Skyscraper Scamper - Night Act 1"), (), 0, 0),
+    "Skyscraper Scamper - Day Act 1": (("Arid Sands - Day Act 1", "Skyscraper Scamper - Night Act 1"), (), 10, 0),
+    "Jungle Joyride - Night Act 1": (("Arid Sands - Day Act 1", "Skyscraper Scamper - Night Act 1"), (), 0, 15),
     "Jungle Joyride - Day Act 1": (("Dark Guardian", "Skyscraper Scamper - Day Act 1", "Jungle Joyride - Night Act 1"), (), 20, 0),
     "Egg Lancer": (("Jungle Joyride - Day Act 1",), (), 0, 0),
     "Eggmanland": (("Egg Lancer",), (), 20, 20),
@@ -77,11 +83,144 @@ COUNTRY_ACCESS = {
     "Eggmanland": ("Egg Lancer",),
 }
 
+# Spagonia City stays reachable at the normal story point.  The mission
+# Entrance Stage is a distinct physical area requiring BOTH progression Shoes.
+SPAGONIA_ENTRANCE_SHOES = ("Stomping Shoes", "Wall Jump Shoes")
+
+
+def _spagonia_entrance_access(state, player):
+    return all(state.has(shoe, player) for shoe in SPAGONIA_ENTRANCE_SHOES)
+
+
 ACT_RE = re.compile(r"^(?P<stage>.+?) - (?P<time>Day|Night) Act (?P<act>\d+)(?: - \d+)?(?: \(DLC\))?$")
 ACT_IN_COLLECTIBLE_RE = re.compile(r"^(.+?) - (Day|Night) Act (\d+)")
 RANK_OR_CLEAR_RE = re.compile(r" - (?:Act Clear|Boss Clear|Rank [DCBA])$")
 MEDAL_RE = re.compile(r" - (?:Sun|Moon) Medal(?: \(\d+\))?$")
 
+
+
+# AP V0.8.3 shoes/multiworld safety: user-verified DLC acts that can
+# contain each Shoe before the first story Act requiring it.  This is a
+# PLACEMENT policy. It is intentionally NOT a claim that every DLC has
+# a particular medal-level requirement.
+FIRST_SHOES_DLC = {
+    "Windmill Isle - Day Act 1 - 2 (DLC)",
+    "Windmill Isle - Day Act 4 (DLC)",
+    "Savannah Citadel - Day Act 1 - 2 (DLC)",
+    "Savannah Citadel - Day Act 3 - 2 (DLC)",
+    "Savannah Citadel - Day Act 5 (DLC)",
+}
+
+AIR_BOOST_EXTRA_DLC = {
+    "Savannah Citadel - Day Act 4 (DLC)",
+    "Rooftop Run - Day Act 1 - 2 (DLC)",
+    "Rooftop Run - Day Act 2 - 2 (DLC)",
+    "Rooftop Run - Day Act 4 (DLC)",
+    "Cool Edge - Day Act 1 - 2 (DLC)",
+    "Cool Edge - Day Act 2 - 2 (DLC)",
+    "Cool Edge - Day Act 3 (DLC)",
+}
+
+LIGHT_SPEED_EXTRA_DLC = {
+    "Rooftop Run - Day Act 5 (DLC)",
+    "Cool Edge - Day Act 4 (DLC)",
+    "Dragon Road - Day Act 4 (DLC)",
+    "Dragon Road - Day Act 5 (DLC)",
+}
+
+# Get the real DLC names from Locations.py instead of guessing indices.
+_ALL_DLC_STEMS = {
+    name.removesuffix(" - Act Clear")
+    for name in location_table
+    if "(DLC)" in name and name.endswith(" - Act Clear")
+}
+FIRST_SHOES_DLC |= {
+    stem for stem in _ALL_DLC_STEMS
+    if stem.startswith(("Windmill Isle - Night Act", "Savannah Citadel - Night Act"))
+}
+AIR_BOOST_DLC = FIRST_SHOES_DLC | AIR_BOOST_EXTRA_DLC | {
+    stem for stem in _ALL_DLC_STEMS
+    if stem.startswith(("Rooftop Run - Night Act", "Cool Edge - Night Act"))
+}
+LIGHT_SPEED_DLC = AIR_BOOST_DLC | LIGHT_SPEED_EXTRA_DLC | {
+    stem for stem in _ALL_DLC_STEMS if stem.startswith("Dragon Road - Night Act")
+}
+assert LIGHT_SPEED_DLC <= _ALL_DLC_STEMS, "DLC shoe whitelist contains unknown Acts"
+
+SHOE_DLC_ALLOWED = {
+    "Stomping Shoes": FIRST_SHOES_DLC,
+    "Wall Jump Shoes": FIRST_SHOES_DLC,
+    "Air Boost Shoes": AIR_BOOST_DLC,
+    "Light Speed Dash Shoes": LIGHT_SPEED_DLC,
+}
+
+SHOE_DEADLINE = {
+    "Stomping Shoes": "Cool Edge - Day Act 1",
+    "Wall Jump Shoes": "Cool Edge - Day Act 1",
+    "Air Boost Shoes": "Dragon Road - Day Act 1",
+    "Light Speed Dash Shoes": "Arid Sands - Day Act 1",
+}
+
+# Named optional vanilla Acts that are NOT safe for the first two Shoes:
+# Windmill Day 3 and Savannah Day 2/3 need Sun level 3 (30 physical
+# medals), whereas Cool Edge Day 1 needs only Sun level 2 (15).
+_OPTIONAL_BEFORE_AIR_BOOST = {
+    "Windmill Isle - Day Act 3",
+    "Savannah Citadel - Day Act 2",
+    "Savannah Citadel - Day Act 3",
+}
+
+# Restrict Shoes to vetted non-DLC check families and to the exact DLC
+# whitelists above. CD/Art Book locations are not included because their
+# physical reachability has not been verified against these deadlines.
+def shoe_location_allowed(location_name, shoe):
+    if shoe not in SHOE_DLC_ALLOWED:
+        return True
+    if location_name.startswith(("CD #", "Art Book #")):
+        return False
+
+    stem = RANK_OR_CLEAR_RE.sub("", MEDAL_RE.sub("", location_name))
+    if "(DLC)" in location_name:
+        return stem in SHOE_DLC_ALLOWED[shoe]
+
+    # Main story clears/ranks/physical medals, including the boss stages.
+    if stem.endswith(" - Boss"):
+        stem = stem.removesuffix(" - Boss")
+    story = list(STORY)
+    if stem in STORY:
+        return story.index(stem) < story.index(SHOE_DEADLINE[shoe])
+    if stem in _OPTIONAL_BEFORE_AIR_BOOST:
+        return shoe in ("Air Boost Shoes", "Light Speed Dash Shoes")
+
+    # Early hub medals: no Spagonia Entrance before Stomp and Wall Jump.
+    for region in ("Apotos", "Mazuri", "Spagonia", "Holoska", "Chun-nan"):
+        if not stem.startswith(region + " - "):
+            continue
+        if region == "Spagonia" and stem.startswith("Spagonia - Entrance"):
+            return shoe not in ("Stomping Shoes", "Wall Jump Shoes")
+        if region == "Chun-nan":
+            return shoe in ("Air Boost Shoes", "Light Speed Dash Shoes")
+        return True
+    return False
+
+
+def _dlc_access(state, player, stem, root):
+    # This models a CONSERVATIVE earliest sphere for DLC checks, never a
+    # presumed exact Gaia Gate level. All DLC checks keep their root Act
+    # progression requirements; later pools cannot hide early Medal items.
+    if not state.has(event_item(root), player):
+        return False
+    if stem in FIRST_SHOES_DLC:
+        return True
+    if stem in AIR_BOOST_DLC:
+        return state.has("Stomping Shoes", player) and state.has("Wall Jump Shoes", player)
+    if stem in LIGHT_SPEED_DLC:
+        return (state.has("Air Boost Shoes", player)
+                and state.has("Sun Medal", player, 8))
+    # Unknown DLCs are reserved for the later story progression rather than
+    # treated as free checks. Their real medal thresholds still need audit.
+    return (state.has("Light Speed Dash Shoes", player)
+            and state.has("Sun Medal", player, 10))
 
 def event_item(stage):
     return "Cleared: " + stage
@@ -95,25 +234,89 @@ def _stage_req(state, player, stage):
             and state.has("Moon Medal", player, moon))
 
 
+
+# Vanilla secondary Acts: level requirements supplied by the project maintainer.
+# Map *medal levels* to conservative AP item-pack counts (Sun +6, Moon +4).
+# This models item access even when no physical medals have been collected.
+SUN_PACKS_FOR_LEVEL = {3: 5, 4: 8, 5: 10}
+MOON_PACKS_FOR_LEVEL = {3: 8, 4: 12}
+OPTIONAL_ACT_LEVELS = {
+    'Windmill Isle - Day Act 3': (3, 0),
+    'Windmill Isle - Night Act 2': (0, 3),
+    'Savannah Citadel - Night Act 2': (0, 3),
+    'Savannah Citadel - Day Act 2': (3, 0),
+    'Savannah Citadel - Day Act 3': (3, 0),
+    'Rooftop Run - Day Act 2': (4, 0),
+    'Rooftop Run - Day Act 3': (4, 0),
+    'Cool Edge - Day Act 2': (4, 0),
+    'Dragon Road - Day Act 2': (3, 0),
+    'Dragon Road - Day Act 3': (5, 0),
+    'Dragon Road - Night Act 2': (0, 4),
+    'Arid Sands - Day Act 2': (4, 0),
+    'Skyscraper Scamper - Day Act 2': (5, 0),
+    'Jungle Joyride - Night Act 2': (5, 0),
+    'Jungle Joyride - Day Act 2': (4, 0),
+    'Jungle Joyride - Day Act 3': (5, 0),
+}
+
+# Preserve the original Egg Beetle gate for the early Sun Level 3 side Acts.
+OPTIONAL_ADDITIONAL_STORY = {
+    "Windmill Isle - Day Act 3": ("Egg Beetle",),
+    "Savannah Citadel - Day Act 2": ("Egg Beetle",),
+    "Savannah Citadel - Day Act 3": ("Egg Beetle",),
+}
+
+def _optional_act_access(state, player, stem):
+    sun_level, moon_level = OPTIONAL_ACT_LEVELS[stem]
+    match = ACT_RE.fullmatch(stem)
+    if match is None:
+        return False
+    root = f"{match.group('stage')} - {match.group('time')} Act 1"
+    country = STAGE_COUNTRIES.get(match.group('stage'))
+    if root not in STORY or country not in COUNTRY_ACCESS:
+        return False
+    # Having enough medals must never bypass story-unlocking the continent.
+    if not _region_access(state, player, country):
+        return False
+    if not state.has(event_item(root), player):
+        return False
+    if any(not state.has(event_item(req), player)
+           for req in OPTIONAL_ADDITIONAL_STORY.get(stem, ())):
+        return False
+    if sun_level and not state.has("Sun Medal", player, SUN_PACKS_FOR_LEVEL[sun_level]):
+        return False
+    if moon_level and not state.has("Moon Medal", player, MOON_PACKS_FOR_LEVEL[moon_level]):
+        return False
+    return True
+
+
 def _stage_access(state, player, stem):
     if stem in STORY:
         return _stage_req(state, player, stem)
 
-    # This specific optional gate is documented: it opens only after Egg
-    # Beetle and Sun Level 3 (30 physical medals = five +6 AP packages).
-    if stem == "Windmill Isle - Day Act 3":
-        return (state.has(event_item("Egg Beetle"), player)
-                and state.has("Sun Medal", player, 5))
+    if stem in OPTIONAL_ACT_LEVELS:
+        return _optional_act_access(state, player, stem)
 
     match = ACT_RE.match(stem)
     if match:
         stage, time, act = match.group("stage"), match.group("time"), int(match.group("act"))
         root = f"{stage} - {time} Act 1"
         if root in STORY:
-            # The additional Acts are accessed after their first main Act.
-            # Some optional Gaia Gates may need MORE medals; those can be added
-            # individually once their exact requirements are verified in game.
-            return state.has(event_item(root), player)
+            if "(DLC)" in stem:
+                return _dlc_access(state, player, stem, root)
+            # Optional non-DLC Gaia Gates must not be treated as free checks:
+            # apply conservative base medal levels until precise per-Act
+            # requirements are verified. Known special cases are above.
+            country = STAGE_COUNTRIES.get(stage)
+            if country not in COUNTRY_ACCESS or not _region_access(state, player, country):
+                return False
+            if not state.has(event_item(root), player):
+                return False
+            if act >= 2:
+                if time == "Day":
+                    return state.has("Sun Medal", player, 5)
+                return state.has("Moon Medal", player, 8)
+            return True
         return False  # Do not accidentally declare unknown stages accessible.
 
     return False
@@ -134,6 +337,10 @@ def _medal_access(state, player, name):
     stem = MEDAL_RE.sub("", name)
     if stem.startswith("Apotos - Village (Night)"):
         return state.has(event_item("Windmill Isle - Day Act 2"), player)
+    # Entrance-stage medals are NOT city medals.  Spagonia's mission Entrance
+    # cannot be reached without both Shoes, even if the city is accessible.
+    if stem.startswith("Spagonia - Entrance"):
+        return _spagonia_entrance_access(state, player)
     if " - Village " in stem or " - Town " in stem or " - City " in stem or " - Entrance" in stem:
         return True  # The location's actual country region already gates it.
     if " - Boss" in stem:
@@ -158,6 +365,11 @@ def _collectible_access(state, player, name):
     # Naming format: 'CD #N - Location - ... (Record Title)'
     # Covers exact stage and Entrance Stage labels (from V0.8.2 wiki pass).
     _, _, source = name.partition(" - ")
+    # CD #2 and Art Books #30/#31 are physically inside Spagonia Entrance.
+    # Unlike Spagonia City items, they require both Shoes.
+    if source.startswith("Spagonia - Entrance Stage"):
+        return (_region_access(state, player, "Spagonia")
+                and _spagonia_entrance_access(state, player))
     country = None
     stage_prefix = None
     for prefix, region in STAGE_COUNTRIES.items():
@@ -234,7 +446,7 @@ def install_rules(world, regions):
                 set_rule(loc, lambda state, name=loc.name: location_access(state, player, name))
 
     medal_names = tuple(n for n, i in location_table.items()
-                        if 88000001 <= i <= 88000370
+                        if i in MEDAL_LOCATION_IDS
                         and (world.options.include_dlc.value or "(DLC)" not in n))
     goal = world.options.goal.value
     victory = world._sonic_victory_event
