@@ -16,6 +16,8 @@ The maintainer originated the ideas, gameplay goals, feature requests and many p
 
 The maintainer is responsible for decisions about what is published and for verifying the resulting software. **AI assistance does not replace code review, testing, security checks, attribution, or the license obligations of the upstream GPL-3.0 project.**
 
+> **V0.9 Beta notice (2026-11-12):** [Windows/Linux V0.9 binaries](https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/releases/tag/V0.9) have been published, but **this source branch has not yet been verified as the complete corresponding source of those binaries**. The V0.9-specific additions and Linux adaptations still need to be synchronized and tagged. Do not identify this branch as the exact V0.9 source until that verification is complete. See [V0.9 source status](https://github.com/ZMGBZak/Sonic-Unleashed-Recompiled-Archipelago-Updates/blob/main/docs/V0.9_SOURCE_STATUS.md).
+
 ## About this Archipelago fork
 
 **This repository contains an unofficial modified version (fork/derivative) of [hedge-dev's Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp), adding Archipelago multiworld support.** The original PC port was developed by the Unleashed Recompiled contributors. This Archipelago edition is a separate community modification, not an official upstream release or endorsement.
